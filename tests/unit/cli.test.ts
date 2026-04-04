@@ -13,7 +13,7 @@ describe("CLI command registration", () => {
   it("registers all 56 commands", () => {
     const program = buildProgram();
     const commandNames = program.commands.map((c) => c.name());
-    expect(commandNames.length).toBe(57);
+    expect(commandNames.length).toBe(58);
   });
 
   it("registers all expected command names", () => {
@@ -32,13 +32,15 @@ describe("CLI command registration", () => {
       "feedback-mark", "feedback", "contribute", "outcomes",
       "snapshot", "export", "import", "merge", "split", "summarize", "versions",
       "migrate", "rewrite", "drift", "negative", "provenance", "associations",
-      "consolidate", "replay", "world", "agreement", "emotional", "help",
+      "consolidate", "replay", "world", "agreement", "emotional",
+      "discovery",
+      "help",
     ];
 
     for (const name of expected) {
       expect(commandNames.has(name), `Missing command: ${name}`).toBe(true);
     }
-    expect(expected.length).toBe(57);
+    expect(expected.length).toBe(58);
   });
 });
 

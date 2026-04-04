@@ -684,6 +684,80 @@ export async function buildApp(): Promise<FastifyInstance> {
     };
   });
 
+  // ─── POST /v1/discovery/run ─────────────────────────────────
+
+  app.post("/v1/discovery/run", { preHandler: verifyApiKey }, async (_request, reply) => {
+    const crossDiscovery = config.agents.cross_discovery;
+    if (!crossDiscovery.enabled) {
+      return reply.code(400).send({ error: "Cross-agent discovery is not enabled" });
+    }
+
+    const dbUrl = process.env.DATABASE_URL;
+    if (!dbUrl) {
+      return reply.code(500).send({ error: "DATABASE_URL not configured" });
+    }
+
+    const { runCrossAgentDiscovery } = await import("./agents/cross-discovery.js");
+    const result = await runCrossAgentDiscovery(dbUrl, crossDiscovery);
+
+    return {
+      shared_entities: result.sharedEntities.length,
+      cross_triples: result.crossTriples.length,
+      group_stats: result.groupStats,
+      entities: result.sharedEntities,
+      triples: result.crossTriples,
+    };
+  });
+
+  // ─── GET /v1/discovery/config ─────────────────────────────────
+
+  app.get("/v1/discovery/config", { preHandler: verifyApiKey }, async () => {
+    return config.agents.cross_discovery;
+  });
+
+  // ─── GET /v1/discovery/shared-entities ────────────────────────
+
+  app.get("/v1/discovery/shared-entities", { preHandler: verifyApiKey }, async (_request, reply) => {
+    const crossDiscovery = config.agents.cross_discovery;
+    if (!crossDiscovery.enabled) {
+      return reply.code(400).send({ error: "Cross-agent discovery is not enabled" });
+    }
+
+    const dbUrl = process.env.DATABASE_URL;
+    if (!dbUrl) {
+      return reply.code(500).send({ error: "DATABASE_URL not configured" });
+    }
+
+    const { discoverSharedEntities } = await import("./agents/cross-discovery.js");
+    const entities = await discoverSharedEntities(dbUrl, crossDiscovery);
+    return { shared_entities: entities, count: entities.length };
+  });
+
+  // ─── GET /v1/discovery/groups ─────────────────────────────────
+
+  app.get("/v1/discovery/groups", { preHandler: verifyApiKey }, async () => {
+    const crossDiscovery = config.agents.cross_discovery;
+    const groups = crossDiscovery.groups.map((g) => ({
+      name: g.name,
+      agents: g.agents,
+      agent_count: g.agents.length,
+    }));
+
+    const bridges = crossDiscovery.bridges.map((b) => ({
+      from: b.from,
+      to: b.to,
+      mode: b.mode,
+    }));
+
+    return {
+      enabled: crossDiscovery.enabled,
+      groups,
+      bridges,
+      group_count: groups.length,
+      bridge_count: bridges.length,
+    };
+  });
+
   return app;
 }
 

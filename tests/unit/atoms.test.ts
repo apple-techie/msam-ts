@@ -214,14 +214,14 @@ describe("getAtomStats", () => {
     const { getAtomStats } = await import("../../src/core/atoms.js");
     const stats = await getAtomStats();
 
-    expect(stats).toHaveProperty("totalAtoms");
-    expect(stats).toHaveProperty("activeAtoms");
-    expect(stats).toHaveProperty("byStream");
-    expect(stats).toHaveProperty("byProfile");
-    expect(stats).toHaveProperty("byState");
-    expect(stats).toHaveProperty("totalAccesses");
-    expect(stats).toHaveProperty("avgActivation");
-    expect(stats).toHaveProperty("estActiveTokens");
+    expect(stats).toHaveProperty("total_atoms");
+    expect(stats).toHaveProperty("active_atoms");
+    expect(stats).toHaveProperty("by_stream");
+    expect(stats).toHaveProperty("by_profile");
+    expect(stats).toHaveProperty("by_state");
+    expect(stats).toHaveProperty("total_accesses");
+    expect(stats).toHaveProperty("avg_activation");
+    expect(stats).toHaveProperty("est_active_tokens");
   });
 });
 

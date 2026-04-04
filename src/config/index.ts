@@ -211,9 +211,27 @@ const ContextSchema = z.object({
   metrics_port: z.number().int().optional(),
 }).default({});
 
+const CrossDiscoveryGroupSchema = z.object({
+  name: z.string(),
+  agents: z.array(z.string()),
+});
+
+const CrossDiscoveryBridgeSchema = z.object({
+  from: z.string(),
+  to: z.string(),
+  mode: z.enum(["entities-only", "full", "off"]).default("off"),
+});
+
+const CrossDiscoverySchema = z.object({
+  enabled: z.boolean().default(false),
+  groups: z.array(CrossDiscoveryGroupSchema).default([]),
+  bridges: z.array(CrossDiscoveryBridgeSchema).default([]),
+}).default({});
+
 const AgentsSchema = z.object({
   default_agent_id: z.string().default("default"),
   enable_sharing: z.boolean().default(true),
+  cross_discovery: CrossDiscoverySchema,
 }).default({});
 
 const CompressionSchema = z.object({

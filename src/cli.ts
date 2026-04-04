@@ -1384,6 +1384,61 @@ export function registerCommands(program: Command): void {
 
   // ─── Help ─────────────────────────────────────────────────────
 
+  // ─── Discovery ────────────────────────────────────────────────
+
+  program
+    .command("discovery <subcommand>")
+    .description("Cross-agent knowledge discovery")
+    .action(async (subcommand: string) => {
+      const { getConfig } = await import("./config/index.js");
+      const cfg = getConfig();
+      const crossDiscovery = cfg.agents.cross_discovery;
+
+      if (subcommand === "run") {
+        if (!crossDiscovery.enabled) {
+          errExit("Cross-agent discovery is not enabled in config");
+        }
+        const dbUrl = process.env.DATABASE_URL;
+        if (!dbUrl) errExit("DATABASE_URL not set");
+
+        const { runCrossAgentDiscovery } = await import("./agents/cross-discovery.js");
+        const result = await runCrossAgentDiscovery(dbUrl, crossDiscovery);
+        jsonOut({
+          shared_entities: result.sharedEntities.length,
+          cross_triples: result.crossTriples.length,
+          group_stats: result.groupStats,
+          entities: result.sharedEntities,
+          triples: result.crossTriples,
+        });
+      } else if (subcommand === "status") {
+        jsonOut({
+          enabled: crossDiscovery.enabled,
+          groups: crossDiscovery.groups.map((g) => ({
+            name: g.name,
+            agent_count: g.agents.length,
+            agents: g.agents,
+          })),
+          bridges: crossDiscovery.bridges.map((b) => ({
+            from: b.from,
+            to: b.to,
+            mode: b.mode,
+          })),
+        });
+      } else if (subcommand === "shared") {
+        if (!crossDiscovery.enabled) {
+          errExit("Cross-agent discovery is not enabled in config");
+        }
+        const dbUrl = process.env.DATABASE_URL;
+        if (!dbUrl) errExit("DATABASE_URL not set");
+
+        const { discoverSharedEntities } = await import("./agents/cross-discovery.js");
+        const entities = await discoverSharedEntities(dbUrl, crossDiscovery);
+        jsonOut({ shared_entities: entities, count: entities.length });
+      } else {
+        errExit("Usage: discovery run | discovery status | discovery shared");
+      }
+    });
+
   program
     .command("help")
     .description("Print grouped command reference")
@@ -1465,6 +1520,11 @@ Maintenance:
   world                        World model (temporal KG)
   agreement                    Sycophancy tracking
   emotional                    Emotional state logging
+
+Discovery:
+  discovery run                Run cross-agent discovery
+  discovery status             Show groups, bridges, config
+  discovery shared             List shared entities
 
   help                         This message`);
     });

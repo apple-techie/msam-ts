@@ -38,8 +38,14 @@ describe("createEmbeddingProvider", () => {
     ).toThrow("Unknown embedding provider: bogus");
   });
 
+  it("creates OpenAI provider with API key", () => {
+    const provider = createEmbeddingProvider({ provider: "openai", apiKey: "test-key" });
+    expect(provider.name).toBe("openai");
+    expect(provider.dimension).toBe(1536);
+  });
+
   it("creates stub providers that throw on use", () => {
-    for (const p of ["openai", "onnx", "local"] as const) {
+    for (const p of ["onnx", "local"] as const) {
       const provider = createEmbeddingProvider({ provider: p });
       expect(() => provider.embed(["test"])).toThrow("not yet implemented");
     }
