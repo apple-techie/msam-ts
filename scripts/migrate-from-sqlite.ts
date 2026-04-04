@@ -562,48 +562,86 @@ if (isDirectExecution) {
       }
 
       if (args.force && existingCount > 0) {
-        console.log("--force: truncating all tables...");
-        const truncateOrder = [
-          "retrieval_feedback", "sentence_embeddings", "temporal_patterns",
-          "retrieval_outcomes", "atom_relations", "atom_versions", "forgetting_log",
-          "provenance", "negative_knowledge", "co_retrieval", "triples",
-          "corrections", "access_log", "atom_topics", "schema_version",
-          "agents", "atoms",
-        ];
-        for (const table of truncateOrder) {
-          await client.query(`TRUNCATE "${table}" CASCADE`);
+        console.log("--force: truncating and re-migrating in transaction...");
+        await client.query("BEGIN");
+        try {
+          const truncateOrder = [
+            "retrieval_feedback", "sentence_embeddings", "temporal_patterns",
+            "retrieval_outcomes", "atom_relations", "atom_versions", "forgetting_log",
+            "provenance", "negative_knowledge", "co_retrieval", "triples",
+            "corrections", "access_log", "atom_topics", "schema_version",
+            "agents", "atoms",
+          ];
+          for (const table of truncateOrder) {
+            await client.query(`TRUNCATE "${table}" CASCADE`);
+          }
+          console.log("Truncated all tables.");
+
+          for (const table of TABLES) {
+            const rows = sqliteDb.prepare(`SELECT * FROM "${table.sqliteTable}"`).all() as Record<string, unknown>[];
+            const total = rows.length;
+
+            if (total === 0) {
+              console.log(`${table.name}: 0 rows (skipped)`);
+              continue;
+            }
+
+            let migrated = 0;
+
+            for (let i = 0; i < total; i += BATCH_SIZE) {
+              const batch = rows.slice(i, i + BATCH_SIZE);
+              const transformed = batch.map(table.transform);
+              const { text, values } = table.insertSql(transformed);
+
+              await client.query(text, values);
+              migrated += batch.length;
+              process.stdout.write(`\rMigrated ${table.name}: ${migrated}/${total}`);
+            }
+
+            if (table.hasSerial) {
+              await client.query(
+                `SELECT setval(pg_get_serial_sequence('"${table.pgTable}"', 'id'), COALESCE((SELECT MAX(id) FROM "${table.pgTable}"), 0) + 1, false)`,
+              );
+            }
+
+            console.log(`\rMigrated ${table.name}: ${migrated}/${total}`);
+          }
+
+          await client.query("COMMIT");
+        } catch (e) {
+          await client.query("ROLLBACK");
+          throw e;
         }
-        console.log("Truncated all tables.");
-      }
+      } else {
+        for (const table of TABLES) {
+          const rows = sqliteDb.prepare(`SELECT * FROM "${table.sqliteTable}"`).all() as Record<string, unknown>[];
+          const total = rows.length;
 
-      for (const table of TABLES) {
-        const rows = sqliteDb.prepare(`SELECT * FROM "${table.sqliteTable}"`).all() as Record<string, unknown>[];
-        const total = rows.length;
+          if (total === 0) {
+            console.log(`${table.name}: 0 rows (skipped)`);
+            continue;
+          }
 
-        if (total === 0) {
-          console.log(`${table.name}: 0 rows (skipped)`);
-          continue;
+          let migrated = 0;
+
+          for (let i = 0; i < total; i += BATCH_SIZE) {
+            const batch = rows.slice(i, i + BATCH_SIZE);
+            const transformed = batch.map(table.transform);
+            const { text, values } = table.insertSql(transformed);
+
+            await client.query(text, values);
+            migrated += batch.length;
+            process.stdout.write(`\rMigrated ${table.name}: ${migrated}/${total}`);
+          }
+
+          if (table.hasSerial) {
+            await client.query(
+              `SELECT setval(pg_get_serial_sequence('"${table.pgTable}"', 'id'), COALESCE((SELECT MAX(id) FROM "${table.pgTable}"), 0) + 1, false)`,
+            );
+          }
+
+          console.log(`\rMigrated ${table.name}: ${migrated}/${total}`);
         }
-
-        let migrated = 0;
-
-        for (let i = 0; i < total; i += BATCH_SIZE) {
-          const batch = rows.slice(i, i + BATCH_SIZE);
-          const transformed = batch.map(table.transform);
-          const { text, values } = table.insertSql(transformed);
-
-          await client.query(text, values);
-          migrated += batch.length;
-          process.stdout.write(`\rMigrated ${table.name}: ${migrated}/${total}`);
-        }
-
-        if (table.hasSerial) {
-          await client.query(
-            `SELECT setval(pg_get_serial_sequence('"${table.pgTable}"', 'id'), COALESCE((SELECT MAX(id) FROM "${table.pgTable}"), 0) + 1, false)`,
-          );
-        }
-
-        console.log(`\rMigrated ${table.name}: ${migrated}/${total}`);
       }
 
       console.log("\nMigration complete. Running verification...\n");

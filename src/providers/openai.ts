@@ -21,6 +21,11 @@ export class OpenAIProvider implements EmbeddingProvider {
   private readonly apiKey: string;
   private readonly batchSize: number;
 
+  private consecutiveFailures = 0;
+  private circuitOpenUntil = 0;
+  private static readonly FAILURE_THRESHOLD = 3;
+  private static readonly RESET_TIMEOUT_MS = 60_000;
+
   constructor(config: EmbeddingProviderConfig) {
     this.url = config.baseUrl ?? DEFAULT_URL;
     this.model = config.model ?? DEFAULT_MODEL;
@@ -58,6 +63,10 @@ export class OpenAIProvider implements EmbeddingProvider {
     texts: string[],
     attempt = 0,
   ): Promise<Array<{ index: number; embedding: number[] }>> {
+    if (Date.now() < this.circuitOpenUntil) {
+      throw new Error(`Circuit breaker open for ${this.name} — will retry after ${new Date(this.circuitOpenUntil).toISOString()}`);
+    }
+
     const body = JSON.stringify({
       input: texts,
       model: this.model,
@@ -80,9 +89,15 @@ export class OpenAIProvider implements EmbeddingProvider {
         return this.callApi(texts, attempt + 1);
       }
       const errBody = await response.text().catch(() => "");
+      this.consecutiveFailures++;
+      if (this.consecutiveFailures >= OpenAIProvider.FAILURE_THRESHOLD) {
+        this.circuitOpenUntil = Date.now() + OpenAIProvider.RESET_TIMEOUT_MS;
+        console.error(`[${this.name}] Circuit breaker OPEN after ${this.consecutiveFailures} failures. Will reset at ${new Date(this.circuitOpenUntil).toISOString()}`);
+      }
       throw new Error(`OpenAI embedding API error ${response.status}: ${errBody.slice(0, 200)}`);
     }
 
+    this.consecutiveFailures = 0;
     const data = (await response.json()) as OpenAIEmbeddingResponse;
     return data.data;
   }

@@ -1,5 +1,7 @@
+import { timingSafeEqual } from "node:crypto";
 import Fastify, { type FastifyInstance, type FastifyRequest, type FastifyReply } from "fastify";
 import cors from "@fastify/cors";
+import rateLimit from "@fastify/rate-limit";
 
 import { getConfig } from "./config/index.js";
 import { healthCheck } from "./db/connection.js";
@@ -18,6 +20,15 @@ import { scheduleGraphSync } from "./graph/sync.js";
 import { getDb } from "./db/connection.js";
 import { atoms, accessLog } from "./db/schema.js";
 import { eq, and, sql, gte, desc } from "drizzle-orm";
+import {
+  incAtomStored,
+  observeRetrievalDuration,
+  incRetrievalResult,
+  incDecayTransition,
+  incApiRequest,
+  observeApiDuration,
+  metricsEndpoint,
+} from "./metrics/instrumentation.js";
 
 // ─── Decay Lock ─────────────────────────────────────────────────
 
@@ -28,24 +39,66 @@ let _decayRunning = false;
 function verifyApiKey(request: FastifyRequest, reply: FastifyReply, done: (err?: Error) => void) {
   const apiKey = process.env.MSAM_API_KEY;
   if (!apiKey) return done();
-  const provided = request.headers["x-api-key"];
-  if (provided !== apiKey) {
-    reply.code(401).send({ error: "Invalid API key" });
+  const provided = request.headers["x-api-key"] as string | undefined;
+  if (!provided || provided.length !== apiKey.length || !timingSafeEqual(Buffer.from(provided), Buffer.from(apiKey))) {
+    reply.code(401).send({ detail: "Invalid API key" });
     return;
   }
   done();
 }
 
+// ─── Validation Sets ────────────────────────────────────────────
+
+const VALID_STREAMS = new Set(["semantic", "episodic", "procedural", "working"]);
+const VALID_PROFILES = new Set(["lightweight", "standard", "full"]);
+const VALID_SOURCE_TYPES = new Set(["api", "conversation", "observation", "reflection", "system"]);
+
 // ─── Build App ──────────────────────────────────────────────────
 
 export async function buildApp(): Promise<FastifyInstance> {
   const config = getConfig();
-  const app = Fastify({ logger: true });
+  const app = Fastify({ logger: true, bodyLimit: 51200 });
 
   await app.register(cors, {
     origin: config.api.allowed_origins,
     credentials: true,
     methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+  });
+
+  await app.register(rateLimit, {
+    max: 100,
+    timeWindow: "1 minute",
+    keyGenerator: (request) => request.ip,
+    errorResponseBuilder: () => ({
+      detail: "Rate limit exceeded. Max 100 requests per minute.",
+      statusCode: 429,
+    }),
+  });
+
+  app.setErrorHandler((error: { statusCode?: number; message: string }, request, reply) => {
+    request.log.error(error);
+    const statusCode = error.statusCode ?? 500;
+    if (statusCode >= 500) {
+      reply.code(statusCode).send({ detail: "Internal server error" });
+    } else {
+      reply.code(statusCode).send({ detail: error.message });
+    }
+  });
+
+  // ─── Metrics Hook ──────────────────────────────────────────
+
+  app.addHook("onResponse", (request, reply, done) => {
+    incApiRequest(request.method, request.url, reply.statusCode);
+    observeApiDuration(request.method, request.url, reply.elapsedTime / 1000);
+    done();
+  });
+
+  // ─── GET /v1/metrics ───────────────────────────────────────
+
+  app.get("/v1/metrics", async (_request, reply) => {
+    const metrics = await metricsEndpoint();
+    reply.header("Content-Type", "text/plain; version=0.0.4; charset=utf-8");
+    return metrics;
   });
 
   // ─── GET /v1/health ─────────────────────────────────────────
@@ -72,8 +125,18 @@ export async function buildApp(): Promise<FastifyInstance> {
       agent_id?: string;
       embedding?: number[];
     };
-  }>("/v1/store", { preHandler: verifyApiKey }, async (request) => {
+  }>("/v1/store", { preHandler: verifyApiKey }, async (request, reply) => {
     const { content, stream, profile, use_llm_annotate, source_type, metadata, agent_id, embedding } = request.body;
+
+    if (stream && !VALID_STREAMS.has(stream)) {
+      return reply.code(400).send({ detail: `Invalid stream: ${stream}. Must be one of: ${[...VALID_STREAMS].join(", ")}` });
+    }
+    if (profile && !VALID_PROFILES.has(profile)) {
+      return reply.code(400).send({ detail: `Invalid profile: ${profile}. Must be one of: ${[...VALID_PROFILES].join(", ")}` });
+    }
+    if (source_type && !VALID_SOURCE_TYPES.has(source_type)) {
+      return reply.code(400).send({ detail: `Invalid source_type: ${source_type}. Must be one of: ${[...VALID_SOURCE_TYPES].join(", ")}` });
+    }
 
     const annotations = await annotateContent(content, use_llm_annotate);
     const resolvedStream = stream ?? classifyStream(content);
@@ -116,6 +179,7 @@ export async function buildApp(): Promise<FastifyInstance> {
     }
 
     scheduleGraphSync();
+    incAtomStored();
 
     return {
       stored: true,
@@ -147,6 +211,13 @@ export async function buildApp(): Promise<FastifyInstance> {
     return { stored: atomId !== null, atom_id: atomId, stream: "working" };
   });
 
+  // ─── POST /v1/expire-working ─────────────────────────────────
+
+  app.post("/v1/expire-working", { preHandler: verifyApiKey }, async () => {
+    const count = await expireWorkingMemory();
+    return { expired: count };
+  });
+
   // ─── POST /v1/query ─────────────────────────────────────────
 
   app.post<{
@@ -160,6 +231,7 @@ export async function buildApp(): Promise<FastifyInstance> {
     };
   }>("/v1/query", { preHandler: verifyApiKey }, async (request) => {
     const { query, mode, top_k, token_budget, agent_id } = request.body;
+    const topK = Math.min(top_k ?? 12, 100);
 
     const t0 = performance.now();
 
@@ -167,7 +239,7 @@ export async function buildApp(): Promise<FastifyInstance> {
     const result = await retrieve({
       query,
       mode: (mode ?? "task") as any,
-      topK: top_k ?? 12,
+      topK,
       agentId: agent_id,
       db: {
         async hybridRetrieve(queryEmbedding, retrievalMode, topK) {
@@ -208,6 +280,7 @@ export async function buildApp(): Promise<FastifyInstance> {
     });
 
     const latencyMs = performance.now() - t0;
+    observeRetrievalDuration(latencyMs / 1000);
 
     const outputAtoms = result.atoms.map((a) => ({
       id: a.atom.id,
@@ -219,6 +292,10 @@ export async function buildApp(): Promise<FastifyInstance> {
       topics: a.atom.topics ?? [],
     }));
 
+    for (const _a of outputAtoms) {
+      incRetrievalResult(result.tier);
+    }
+
     const totalTokens = outputAtoms.reduce((sum, a) => sum + Math.max(1, Math.floor(a.content.length / 4)), 0);
 
     const response: Record<string, unknown> = {
@@ -227,6 +304,7 @@ export async function buildApp(): Promise<FastifyInstance> {
       confidence_tier: result.tier,
       triples: [],
       atoms: outputAtoms,
+      query_type: "mixed",
       total_tokens: totalTokens,
       items_returned: outputAtoms.length,
       latency_ms: Math.round(latencyMs * 100) / 100,
@@ -368,12 +446,16 @@ export async function buildApp(): Promise<FastifyInstance> {
 
   app.post("/v1/decay", { preHandler: verifyApiKey }, async (_request, reply) => {
     if (_decayRunning) {
-      return reply.code(409).send({ error: "Decay cycle already in progress" });
+      return reply.code(409).send({ detail: "Decay cycle already in progress" });
     }
     _decayRunning = true;
     try {
       const decayResult = await runDecayCycle();
       const workingExpired = await expireWorkingMemory();
+
+      if (decayResult.faded > 0) incDecayTransition("active", "fading");
+      if (decayResult.dormanted > 0) incDecayTransition("fading", "dormant");
+      if (decayResult.reactivated > 0) incDecayTransition("fading", "active");
 
       return {
         ...decayResult,
@@ -438,7 +520,7 @@ export async function buildApp(): Promise<FastifyInstance> {
     Params: { entity: string };
     Querystring: { max_hops?: string };
   }>("/v1/triples/graph/:entity", { preHandler: verifyApiKey }, async (request) => {
-    const maxHops = Number(request.query.max_hops ?? "3");
+    const maxHops = Math.min(Number(request.query.max_hops ?? 3), 6);
     return graphTraverse(request.params.entity, maxHops);
   });
 
@@ -491,7 +573,8 @@ export async function buildApp(): Promise<FastifyInstance> {
     ];
 
     if (topic) {
-      conditions.push(sql`(content ILIKE ${'%' + topic + '%'} OR ${topic} = ANY(topics))`);
+      const escaped = topic.replace(/[%_\\]/g, (c) => `\\${c}`);
+      conditions.push(sql`(content ILIKE ${'%' + escaped + '%'} OR ${topic} = ANY(topics))`);
     }
     if (since) {
       conditions.push(sql`created_at >= ${new Date(since)}`);
@@ -783,10 +866,31 @@ export async function startServer(opts: { host?: string; port?: number } = {}): 
 
   const app = await buildApp();
 
+  // Test database connectivity before accepting requests
+  const dbOk = await healthCheck();
+  if (!dbOk) {
+    console.error("FATAL: Cannot connect to database. Check DATABASE_URL.");
+    process.exit(1);
+  }
+  console.log("Database connection verified");
+
   await app.listen({ host, port });
   console.log(`MSAM REST API server listening on ${host}:${port}`);
   console.log(`  Health check: http://${host}:${port}/v1/health`);
   console.log(`  API key: ${process.env.MSAM_API_KEY ? "required" : "not required (open access)"}`);
+
+  const shutdown = async (signal: string) => {
+    console.log(`Received ${signal}, shutting down gracefully...`);
+    const { cancelGraphSync } = await import("./graph/sync.js");
+    cancelGraphSync();
+    await app.close();
+    const { shutdown: closeDb } = await import("./db/connection.js");
+    await closeDb();
+    process.exit(0);
+  };
+
+  process.on("SIGTERM", () => shutdown("SIGTERM"));
+  process.on("SIGINT", () => shutdown("SIGINT"));
 
   return app;
 }

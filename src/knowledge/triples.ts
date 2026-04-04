@@ -1,14 +1,19 @@
 import { createHash } from "node:crypto";
 import { eq, and, or, sql, ilike, desc, inArray } from "drizzle-orm";
 import { getDb } from "../db/connection.js";
-import { triples, atoms } from "../db/schema.js";
+import { triples, atoms, vectorToDriver } from "../db/schema.js";
 import { getConfig } from "../config/index.js";
 import type { Triple, RetrievalResult } from "../core/types.js";
-import { cosineSimilarity } from "../core/act-r.js";
 import {
   createEmbeddingProvider,
   type EmbeddingProvider,
 } from "../providers/embedding-provider.js";
+
+// ─── LIKE Escape Helper ─────────────────────────────────────────
+
+function escapeLike(input: string): string {
+  return input.replace(/[%_\\]/g, (c) => `\\${c}`);
+}
 
 // ─── Query Classification ────────────────────────────────────────
 
@@ -211,13 +216,6 @@ export async function storeTriple(triple: {
   const id = generateTripleId(triple.subject, triple.predicate, triple.object);
   const now = new Date();
 
-  const existing = await db
-    .select({ id: triples.id })
-    .from(triples)
-    .where(eq(triples.id, id))
-    .limit(1);
-  if (existing.length > 0) return;
-
   const embedding = await embedTripleSafe(triple.subject, triple.predicate, triple.object);
 
   await db.insert(triples).values({
@@ -230,7 +228,7 @@ export async function storeTriple(triple: {
     state: "active",
     embedding,
     createdAt: now,
-  });
+  }).onConflictDoNothing();
 }
 
 export async function getTriples(params: {
@@ -243,10 +241,10 @@ export async function getTriples(params: {
   const conditions = [eq(triples.state, "active")];
 
   if (params.subject) {
-    conditions.push(ilike(triples.subject, params.subject));
+    conditions.push(ilike(triples.subject, escapeLike(params.subject)));
   }
   if (params.object) {
-    conditions.push(ilike(triples.object, params.object));
+    conditions.push(ilike(triples.object, escapeLike(params.object)));
   }
 
   const rows = await db
@@ -283,8 +281,8 @@ export async function graphTraverse(
           and(
             eq(triples.state, "active"),
             or(
-              ilike(triples.subject, node),
-              ilike(triples.object, node),
+              ilike(triples.subject, escapeLike(node)),
+              ilike(triples.object, escapeLike(node)),
             ),
           ),
         );
@@ -339,8 +337,8 @@ export async function graphPath(
         and(
           eq(triples.state, "active"),
           or(
-            ilike(triples.subject, node),
-            ilike(triples.object, node),
+            ilike(triples.subject, escapeLike(node)),
+            ilike(triples.object, escapeLike(node)),
           ),
         ),
       );
@@ -376,8 +374,8 @@ async function reconstructChain(
         and(
           eq(triples.state, "active"),
           or(
-            and(ilike(triples.subject, a), ilike(triples.object, b)),
-            and(ilike(triples.subject, b), ilike(triples.object, a)),
+            and(ilike(triples.subject, escapeLike(a)), ilike(triples.object, escapeLike(b))),
+            and(ilike(triples.subject, escapeLike(b)), ilike(triples.object, escapeLike(a))),
           ),
         ),
       )
@@ -414,23 +412,21 @@ async function retrieveTriplesBySimilarity(query: string, topK: number): Promise
     return keywordFallback(query, topK);
   }
 
-  const rows = await db
-    .select()
-    .from(triples)
-    .where(and(eq(triples.state, "active"), sql`${triples.embedding} IS NOT NULL`));
+  const limit = Math.min(topK, 50);
+  const minSim = 0.2;
+  const vectorParam = vectorToDriver(queryVec);
 
-  const scored: Array<{ triple: Triple; score: number }> = [];
-  for (const row of rows) {
-    if (!row.embedding) continue;
-    const sim = cosineSimilarity(queryVec, row.embedding);
-    scored.push({
-      triple: rowToTriple(row),
-      score: sim * (row.confidence ?? 1.0),
-    });
-  }
+  const result = await db.execute(sql`
+    SELECT t.*, 1 - (t.embedding <=> ${vectorParam}::vector) AS similarity
+    FROM triples t
+    WHERE t.state = 'active' AND t.embedding IS NOT NULL
+    ORDER BY t.embedding <=> ${vectorParam}::vector
+    LIMIT ${limit}
+  `);
 
-  scored.sort((a, b) => b.score - a.score);
-  return scored.slice(0, topK).map((s) => s.triple);
+  return result.rows
+    .filter((r: any) => Number(r.similarity) >= minSim)
+    .map((r: any) => rowToTriple(r));
 }
 
 async function keywordFallback(query: string, topK: number): Promise<Triple[]> {
@@ -445,9 +441,9 @@ async function keywordFallback(query: string, topK: number): Promise<Triple[]> {
   const conditions = terms.map(
     (term) =>
       or(
-        ilike(triples.subject, `%${term}%`),
-        ilike(triples.predicate, `%${term}%`),
-        ilike(triples.object, `%${term}%`),
+        ilike(triples.subject, `%${escapeLike(term)}%`),
+        ilike(triples.predicate, `%${escapeLike(term)}%`),
+        ilike(triples.object, `%${escapeLike(term)}%`),
       ),
   );
 

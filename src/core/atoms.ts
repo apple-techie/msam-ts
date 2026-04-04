@@ -90,26 +90,35 @@ export async function storeAtom(params: StoreAtomParams): Promise<string | null>
   const topicsList = params.topics ?? [];
 
   try {
-    await db.insert(atoms).values({
-      id: atomId,
-      profile: params.profile ?? "standard",
-      stream: params.stream ?? "semantic",
-      content,
-      contentHash: hash,
-      createdAt: now,
-      arousal: params.arousal ?? 0.5,
-      valence: params.valence ?? 0.0,
-      topics: topicsList,
-      encodingConfidence: params.encodingConfidence ?? 0.7,
-      provisional: params.provisional ?? false,
-      sourceType: params.sourceType ?? "conversation",
-      embedding: params.embedding ?? null,
-      metadata: meta,
-      agentId: params.agentId ?? "default",
-      embeddingProvider: params.embeddingProvider ?? null,
-      isPinned,
-      sessionId,
-      workingExpiresAt,
+    await db.transaction(async (tx) => {
+      await tx.insert(atoms).values({
+        id: atomId,
+        profile: params.profile ?? "standard",
+        stream: params.stream ?? "semantic",
+        content,
+        contentHash: hash,
+        createdAt: now,
+        arousal: params.arousal ?? 0.5,
+        valence: params.valence ?? 0.0,
+        topics: topicsList,
+        encodingConfidence: params.encodingConfidence ?? 0.7,
+        provisional: params.provisional ?? false,
+        sourceType: params.sourceType ?? "conversation",
+        embedding: params.embedding ?? null,
+        metadata: meta,
+        agentId: params.agentId ?? "default",
+        embeddingProvider: params.embeddingProvider ?? null,
+        isPinned,
+        sessionId,
+        workingExpiresAt,
+      });
+
+      if (topicsList.length > 0) {
+        await tx
+          .insert(atomTopics)
+          .values(topicsList.map((t) => ({ atomId, topic: t })))
+          .onConflictDoNothing();
+      }
     });
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
@@ -117,13 +126,6 @@ export async function storeAtom(params: StoreAtomParams): Promise<string | null>
       return null;
     }
     throw err;
-  }
-
-  if (topicsList.length > 0) {
-    await db
-      .insert(atomTopics)
-      .values(topicsList.map((t) => ({ atomId, topic: t })))
-      .onConflictDoNothing();
   }
 
   return atomId;
@@ -181,13 +183,13 @@ export async function similaritySearch(
   const states = params.states ?? ["active", "fading"];
 
   const vectorParam = vectorToDriver(embedding);
-  const statesLiteral = states.map((s) => `'${s}'`).join(", ");
+  const statesSql = sql.join(states.map(s => sql`${s}`), sql`, `);
 
   let queryStr = sql`
     SELECT *,
       1 - (embedding <=> ${vectorParam}::vector) AS similarity
     FROM atoms
-    WHERE state IN (${sql.raw(statesLiteral)})
+    WHERE state IN (${statesSql})
       AND embedding IS NOT NULL
   `;
 
@@ -366,6 +368,11 @@ export async function getAtomStats(agentId?: string): Promise<AtomStats> {
   const byState: Record<string, number> = {};
   for (const r of stateResult.rows) byState[String(r.state)] = Number(r.count);
 
+  const sizeResult = await db.execute(
+    sql`SELECT pg_database_size(current_database()) / 1024 AS size_kb`,
+  );
+  const dbSizeKb = Number(sizeResult.rows[0]?.size_kb ?? 0);
+
   return {
     total_atoms: Number(totalRow?.count ?? 0),
     active_atoms: Number(activeRow?.count ?? 0),
@@ -375,7 +382,7 @@ export async function getAtomStats(agentId?: string): Promise<AtomStats> {
     total_accesses: Number(accessRow?.count ?? 0),
     avg_activation: Number(accessRow?.avg ?? 0),
     est_active_tokens: Math.floor(Number(tokenRow?.chars ?? 0) / 4),
-    db_size_kb: 0,
+    db_size_kb: Math.round(dbSizeKb * 10) / 10,
   };
 }
 

@@ -3,6 +3,11 @@ import crypto from "node:crypto";
 import { contentHash, generateAtomId } from "../../src/core/atoms.js";
 
 vi.mock("../../src/db/connection.js", () => {
+  const mockTx = {
+    insert: vi.fn().mockReturnThis(),
+    values: vi.fn().mockReturnThis(),
+    onConflictDoNothing: vi.fn().mockResolvedValue(undefined),
+  };
   const mockDb = {
     insert: vi.fn().mockReturnThis(),
     values: vi.fn().mockReturnThis(),
@@ -14,6 +19,7 @@ vi.mock("../../src/db/connection.js", () => {
     update: vi.fn().mockReturnThis(),
     set: vi.fn().mockReturnThis(),
     execute: vi.fn().mockResolvedValue({ rows: [] }),
+    transaction: vi.fn().mockImplementation(async (fn: (tx: typeof mockTx) => Promise<void>) => fn(mockTx)),
   };
   return { getDb: () => mockDb };
 });
@@ -98,9 +104,9 @@ describe("storeAtom", () => {
   it("returns null on duplicate key violation", async () => {
     const { getDb } = await import("../../src/db/connection.js");
     const db = getDb();
-    (db.insert as ReturnType<typeof vi.fn>).mockReturnValue({
-      values: vi.fn().mockRejectedValue(new Error("duplicate key value violates unique constraint idx_atoms_dedup")),
-    });
+    (db.transaction as ReturnType<typeof vi.fn>).mockRejectedValueOnce(
+      new Error("duplicate key value violates unique constraint idx_atoms_dedup"),
+    );
 
     const { storeAtom } = await import("../../src/core/atoms.js");
     const result = await storeAtom({ content: "duplicate content" });

@@ -379,7 +379,12 @@ function loadConfig(): MsamConfig {
   const tomlPath = findTomlPath();
   if (tomlPath) {
     const content = readFileSync(tomlPath, "utf-8");
-    rawData = parseToml(content) as Record<string, unknown>;
+    try {
+      rawData = parseToml(content) as Record<string, unknown>;
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      throw new Error(`Failed to parse MSAM config at ${tomlPath}: ${msg}`);
+    }
   }
 
   _config = MsamConfigSchema.parse(rawData);
@@ -416,7 +421,13 @@ export function getRawConfig(): Record<string, unknown> {
 
 // For testing: allow injecting config from parsed TOML string
 export function loadConfigFromString(toml: string): MsamConfig {
-  const rawData = parseToml(toml) as Record<string, unknown>;
+  let rawData: Record<string, unknown>;
+  try {
+    rawData = parseToml(toml) as Record<string, unknown>;
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    throw new Error(`Failed to parse MSAM config from string: ${msg}`);
+  }
   _config = MsamConfigSchema.parse(rawData);
   return _config;
 }

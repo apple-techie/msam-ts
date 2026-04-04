@@ -26,6 +26,7 @@ export function scheduleGraphSync(): void {
     _syncTimer = null;
     _triggerGraphSync();
   }, GRAPH_SYNC_DEBOUNCE_SECONDS * 1000);
+  _syncTimer.unref();
 }
 
 export function cancelGraphSync(): void {

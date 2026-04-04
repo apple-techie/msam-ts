@@ -8,4 +8,8 @@ dist/
 !drizzle.config.ts
 !tsconfig.json
 .env
+*.env
+.env.*
+!.env.example
+msam.toml
 coverage/

@@ -196,7 +196,7 @@ describe("API key validation", () => {
     });
 
     expect(res.statusCode).toBe(401);
-    expect(res.json().error).toBe("Invalid API key");
+    expect(res.json().detail).toBe("Invalid API key");
     await securedApp.close();
   });
 
@@ -343,7 +343,7 @@ describe("POST /v1/decay", () => {
     // Second call should be rejected
     const secondRes = await app.inject({ method: "POST", url: "/v1/decay" });
     expect(secondRes.statusCode).toBe(409);
-    expect(secondRes.json().error).toContain("already in progress");
+    expect(secondRes.json().detail).toContain("already in progress");
 
     // Clean up
     resolveDecay!();

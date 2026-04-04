@@ -17,6 +17,10 @@ function getPool(): pg.Pool {
       idleTimeoutMillis: 30_000,
       connectionTimeoutMillis: 5_000,
     });
+    pool.on("error", (err) => {
+      console.error("Unexpected PostgreSQL pool error:", err.message);
+      // Don't crash — the pool will attempt to reconnect
+    });
   }
   return pool;
 }

@@ -21,6 +21,11 @@ export class NvidiaNimProvider implements EmbeddingProvider {
   private readonly apiKey: string;
   private readonly batchSize: number;
 
+  private consecutiveFailures = 0;
+  private circuitOpenUntil = 0;
+  private static readonly FAILURE_THRESHOLD = 3;
+  private static readonly RESET_TIMEOUT_MS = 60_000;
+
   constructor(config: Partial<EmbeddingProviderConfig> = {}) {
     this.url = config.baseUrl ?? DEFAULT_URL;
     this.model = config.model ?? DEFAULT_MODEL;
@@ -54,6 +59,10 @@ export class NvidiaNimProvider implements EmbeddingProvider {
   }
 
   private async callApi(inputs: string[]): Promise<number[][]> {
+    if (Date.now() < this.circuitOpenUntil) {
+      throw new Error(`Circuit breaker open for ${this.name} — will retry after ${new Date(this.circuitOpenUntil).toISOString()}`);
+    }
+
     let lastError: Error | undefined;
 
     for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
@@ -88,6 +97,7 @@ export class NvidiaNimProvider implements EmbeddingProvider {
           );
         }
 
+        this.consecutiveFailures = 0;
         const data = (await response.json()) as NimEmbeddingResponse;
         return data.data
           .sort((a, b) => a.index - b.index)
@@ -102,6 +112,12 @@ export class NvidiaNimProvider implements EmbeddingProvider {
         const delay = BASE_DELAY_MS * 2 ** attempt;
         await sleep(delay);
       }
+    }
+
+    this.consecutiveFailures++;
+    if (this.consecutiveFailures >= NvidiaNimProvider.FAILURE_THRESHOLD) {
+      this.circuitOpenUntil = Date.now() + NvidiaNimProvider.RESET_TIMEOUT_MS;
+      console.error(`[${this.name}] Circuit breaker OPEN after ${this.consecutiveFailures} failures. Will reset at ${new Date(this.circuitOpenUntil).toISOString()}`);
     }
 
     throw lastError;

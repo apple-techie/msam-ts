@@ -1283,25 +1283,25 @@ export function registerCommands(program: Command): void {
       const maxEvents = parseInt(opts.max, 10);
       const db = getDb();
 
-      let query = `SELECT id, content, stream, created_at FROM atoms WHERE stream = 'episodic' AND state = 'active'`;
-      const params: unknown[] = [];
+      const conditions = [
+        sql`stream = 'episodic'`,
+        sql`state = 'active'`,
+      ];
 
       if (topic) {
-        query += ` AND content ILIKE $${params.length + 1}`;
-        params.push(`%${topic}%`);
+        conditions.push(sql`content ILIKE ${'%' + topic + '%'}`);
       }
       if (opts.since) {
-        query += ` AND created_at >= $${params.length + 1}`;
-        params.push(opts.since);
+        conditions.push(sql`created_at >= ${opts.since}`);
       }
       if (opts.before) {
-        query += ` AND created_at <= $${params.length + 1}`;
-        params.push(opts.before);
+        conditions.push(sql`created_at <= ${opts.before}`);
       }
-      query += ` ORDER BY created_at ASC LIMIT $${params.length + 1}`;
-      params.push(maxEvents);
 
-      const rows = await db.execute(sql.raw(query));
+      const whereClause = sql.join(conditions, sql` AND `);
+      const rows = await db.execute(
+        sql`SELECT id, content, stream, created_at FROM atoms WHERE ${whereClause} ORDER BY created_at ASC LIMIT ${maxEvents}`,
+      );
       jsonOut({
         topic: topic || null,
         since: opts.since ?? null,
