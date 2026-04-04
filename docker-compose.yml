@@ -9,6 +9,8 @@ services:
       POSTGRES_DB: msam
       POSTGRES_USER: msam
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-msam}
+    ports:
+      - "5433:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U msam -d msam"]
       interval: 10s

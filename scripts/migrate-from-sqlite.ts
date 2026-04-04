@@ -73,7 +73,12 @@ function buildInsert(
   for (const row of rows) {
     const placeholders: string[] = [];
     for (const col of columns) {
-      values.push(row[col] ?? null);
+      let val = row[col] ?? null;
+      // pg driver needs jsonb values stringified
+      if (val !== null && typeof val === "object" && !(val instanceof Date) && !Buffer.isBuffer(val)) {
+        val = JSON.stringify(val);
+      }
+      values.push(val);
       placeholders.push(`$${values.length}`);
     }
     rowPlaceholders.push(`(${placeholders.join(",")})`);

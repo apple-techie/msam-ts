@@ -57,7 +57,7 @@ export const atoms = pgTable(
     content: text("content").notNull(),
     contentHash: text("content_hash").notNull(),
 
-    createdAt: timestamp("created_at", { withTimezone: true }).notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     lastAccessedAt: timestamp("last_accessed_at", { withTimezone: true }),
     accessCount: integer("access_count").default(0),
 
@@ -133,7 +133,7 @@ export const accessLog = pgTable(
     atomId: text("atom_id")
       .notNull()
       .references(() => atoms.id, { onDelete: "cascade" }),
-    accessedAt: timestamp("accessed_at", { withTimezone: true }).notNull(),
+    accessedAt: timestamp("accessed_at", { withTimezone: true }).notNull().defaultNow(),
     activationScore: real("activation_score"),
     retrievalMode: text("retrieval_mode"),
     contributed: integer("contributed").default(-1),
@@ -152,7 +152,7 @@ export const corrections = pgTable("corrections", {
     .references(() => atoms.id, { onDelete: "cascade" }),
   correctionContent: text("correction_content").notNull(),
   reason: text("reason"),
-  createdAt: timestamp("created_at", { withTimezone: true }).notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 });
 
 export type Correction = typeof corrections.$inferSelect;
@@ -195,7 +195,7 @@ export const negativeKnowledge = pgTable(
     query: text("query").notNull(),
     domain: text("domain"),
     result: text("result").default("empty"),
-    searchedAt: timestamp("searched_at", { withTimezone: true }).notNull(),
+    searchedAt: timestamp("searched_at", { withTimezone: true }).notNull().defaultNow(),
     expiresAt: timestamp("expires_at", { withTimezone: true }),
     notes: text("notes"),
   },
@@ -216,7 +216,7 @@ export const provenance = pgTable(
     parentId: text("parent_id"),
     action: text("action").notNull(),
     source: text("source"),
-    timestamp: timestamp("timestamp", { withTimezone: true }).notNull(),
+    timestamp: timestamp("timestamp", { withTimezone: true }).notNull().defaultNow(),
     metadata: jsonb("metadata").default({}),
   },
   (t) => [
@@ -238,7 +238,7 @@ export const forgettingLog = pgTable(
     newState: text("new_state").notNull(),
     reason: text("reason").notNull(),
     factors: jsonb("factors").default({}),
-    timestamp: timestamp("timestamp", { withTimezone: true }).notNull(),
+    timestamp: timestamp("timestamp", { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => [
     index("idx_forget_atom").on(t.atomId),
@@ -259,7 +259,7 @@ export const atomVersions = pgTable(
     content: text("content").notNull(),
     changedBy: text("changed_by"),
     changeReason: text("change_reason"),
-    timestamp: timestamp("timestamp", { withTimezone: true }).notNull(),
+    timestamp: timestamp("timestamp", { withTimezone: true }).notNull().defaultNow(),
     metadata: jsonb("metadata").default({}),
   },
   (t) => [
@@ -280,7 +280,7 @@ export const atomRelations = pgTable(
     targetId: text("target_id").notNull(),
     relationType: text("relation_type").notNull(),
     confidence: real("confidence").default(0.8),
-    createdAt: timestamp("created_at", { withTimezone: true }).notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     metadata: jsonb("metadata").default({}),
   },
   (t) => [
@@ -362,7 +362,7 @@ export const triples = pgTable(
     confidence: real("confidence").default(1.0),
     state: text("state", { enum: ["active", "tombstone"] }).default("active"),
     embedding: vector("embedding", { dimensions: 1536 }),
-    createdAt: timestamp("created_at", { withTimezone: true }).notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => [
     index("idx_triples_subject").on(t.subject),
@@ -417,7 +417,7 @@ export type RetrievalFeedback = typeof retrievalFeedback.$inferSelect;
 export const agents = pgTable("agents", {
   id: text("id").primaryKey(),
   name: text("name"),
-  createdAt: timestamp("created_at", { withTimezone: true }).notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   metadata: jsonb("metadata"),
 });
 
