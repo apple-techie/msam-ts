@@ -69,6 +69,10 @@ export async function buildApp(): Promise<FastifyInstance> {
     max: 100,
     timeWindow: "1 minute",
     keyGenerator: (request) => request.ip,
+    allowList: (request) => {
+      const path = request.url.split("?")[0];
+      return path === "/v1/health" || path === "/v1/metrics";
+    },
     errorResponseBuilder: () => ({
       detail: "Rate limit exceeded. Max 100 requests per minute.",
       statusCode: 429,
@@ -327,7 +331,7 @@ export async function buildApp(): Promise<FastifyInstance> {
   app.post<{
     Body: { top_k?: number; agent_id?: string };
   }>("/v1/context", { preHandler: verifyApiKey }, async (request) => {
-    const topK = request.body?.top_k ?? 5;
+    const topK = Math.min(request.body?.top_k ?? 5, 50);
     const agentId = request.body?.agent_id;
 
     const queries = {
@@ -584,7 +588,7 @@ export async function buildApp(): Promise<FastifyInstance> {
     }
 
     const whereClause = sql.join(conditions, sql` AND `);
-    const limit = max_events ?? 50;
+    const limit = Math.min(max_events ?? 50, 200);
 
     const rows = await db.execute(
       sql`SELECT id, content, stream, created_at, topics FROM atoms WHERE ${whereClause} ORDER BY created_at DESC LIMIT ${limit}`,
@@ -614,7 +618,7 @@ export async function buildApp(): Promise<FastifyInstance> {
     };
   }>("/v1/forget", { preHandler: verifyApiKey }, async (request, reply) => {
     if (_decayRunning) {
-      return reply.code(409).send({ error: "Decay/forget cycle already in progress" });
+      return reply.code(409).send({ detail: "Decay/forget cycle already in progress" });
     }
     _decayRunning = true;
     try {
@@ -644,7 +648,7 @@ export async function buildApp(): Promise<FastifyInstance> {
     Body: { target_provider: string; batch_size?: number; dry_run?: boolean };
   }>("/v1/re-embed", { preHandler: verifyApiKey }, async (request, reply) => {
     if (_decayRunning) {
-      return reply.code(409).send({ error: "Another maintenance operation is in progress" });
+      return reply.code(409).send({ detail: "Another maintenance operation is in progress" });
     }
     _decayRunning = true;
     try {
@@ -772,12 +776,12 @@ export async function buildApp(): Promise<FastifyInstance> {
   app.post("/v1/discovery/run", { preHandler: verifyApiKey }, async (_request, reply) => {
     const crossDiscovery = config.agents.cross_discovery;
     if (!crossDiscovery.enabled) {
-      return reply.code(400).send({ error: "Cross-agent discovery is not enabled" });
+      return reply.code(400).send({ detail: "Cross-agent discovery is not enabled" });
     }
 
     const dbUrl = process.env.DATABASE_URL;
     if (!dbUrl) {
-      return reply.code(500).send({ error: "DATABASE_URL not configured" });
+      return reply.code(500).send({ detail: "DATABASE_URL not configured" });
     }
 
     const { runCrossAgentDiscovery } = await import("./agents/cross-discovery.js");
@@ -803,12 +807,12 @@ export async function buildApp(): Promise<FastifyInstance> {
   app.get("/v1/discovery/shared-entities", { preHandler: verifyApiKey }, async (_request, reply) => {
     const crossDiscovery = config.agents.cross_discovery;
     if (!crossDiscovery.enabled) {
-      return reply.code(400).send({ error: "Cross-agent discovery is not enabled" });
+      return reply.code(400).send({ detail: "Cross-agent discovery is not enabled" });
     }
 
     const dbUrl = process.env.DATABASE_URL;
     if (!dbUrl) {
-      return reply.code(500).send({ error: "DATABASE_URL not configured" });
+      return reply.code(500).send({ detail: "DATABASE_URL not configured" });
     }
 
     const { discoverSharedEntities } = await import("./agents/cross-discovery.js");
@@ -881,11 +885,17 @@ export async function startServer(opts: { host?: string; port?: number } = {}): 
 
   const shutdown = async (signal: string) => {
     console.log(`Received ${signal}, shutting down gracefully...`);
+    const forceExit = setTimeout(() => {
+      console.error("Shutdown timed out after 10s, forcing exit");
+      process.exit(1);
+    }, 10_000);
+    forceExit.unref();
     const { cancelGraphSync } = await import("./graph/sync.js");
     cancelGraphSync();
     await app.close();
     const { shutdown: closeDb } = await import("./db/connection.js");
     await closeDb();
+    clearTimeout(forceExit);
     process.exit(0);
   };
 
