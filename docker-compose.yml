@@ -1,0 +1,156 @@
+services:
+  msam-db:
+    image: pgvector/pgvector:pg16
+    container_name: msam-db
+    restart: unless-stopped
+    volumes:
+      - msam-pgdata:/var/lib/postgresql/data
+    environment:
+      POSTGRES_DB: msam
+      POSTGRES_USER: msam
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-msam}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U msam -d msam"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  msam-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: msam-server
+    restart: unless-stopped
+    ports:
+      - "3901:3901"
+    environment:
+      DATABASE_URL: postgresql://msam:${POSTGRES_PASSWORD:-msam}@msam-db:5432/msam
+      MSAM_API_KEY: ${MSAM_API_KEY}
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      NVIDIA_NIM_API_KEY: ${NVIDIA_NIM_API_KEY}
+      GRAPH_ACCEL_URL: http://msam-graph-accelerator:3902
+      GRAPH_SYNC_DEBOUNCE_SECONDS: ${GRAPH_SYNC_DEBOUNCE_SECONDS:-30}
+    depends_on:
+      msam-db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"fetch('http://localhost:3901/v1/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))\""]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  msam-graph-accelerator:
+    image: msam-graph-accelerator:latest
+    container_name: msam-graph-accelerator
+    restart: unless-stopped
+    ports:
+      - "3902:3902"
+    environment:
+      NEO4J_URI: bolt://msam-neo4j-central:7687
+      NEO4J_USER: ""
+      NEO4J_PASSWORD: ""
+      DATABASE_URL: postgresql://msam:${POSTGRES_PASSWORD:-msam}@msam-db:5432/msam
+      API_PORT: "3902"
+      ENABLE_HYDRA: "false"
+      ENABLE_GIT: "false"
+    depends_on:
+      msam-neo4j-central:
+        condition: service_healthy
+      msam-server:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:3902/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  msam-neo4j-central:
+    image: neo4j:5-community
+    container_name: msam-neo4j-central
+    restart: unless-stopped
+    ports:
+      - "9474:7474"
+      - "9687:7687"
+    volumes:
+      - msam-neo4j-data:/data
+    environment:
+      NEO4J_AUTH: none
+      NEO4J_server_memory_heap_max__size: 512m
+      NEO4J_server_memory_heap_initial__size: 256m
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:7474 || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  msam-kg-viewer:
+    image: node:22-slim
+    container_name: msam-kg-viewer
+    restart: unless-stopped
+    ports:
+      - "7780:7780"
+    volumes:
+      - ${KG_VIEWER_PATH:-./kg-viewer}:/app:ro
+    working_dir: /app
+    command: ["node", "server.mjs"]
+    environment:
+      MSAM_URL: http://msam-server:3901
+      MSAM_API_KEY: ${MSAM_API_KEY}
+    depends_on:
+      msam-server:
+        condition: service_healthy
+
+  msam-grafana:
+    image: grafana/grafana:12.4.1
+    container_name: msam-grafana
+    restart: unless-stopped
+    volumes:
+      - msam-grafana-data:/var/lib/grafana
+    environment:
+      GF_INSTALL_PLUGINS: simpod-json-datasource
+      GF_SERVER_ROOT_URL: ${GRAFANA_ROOT_URL:-https://openclaw-msam.tail3c92ee.ts.net/}
+      GF_SERVER_DOMAIN: ${GRAFANA_DOMAIN:-openclaw-msam.tail3c92ee.ts.net}
+      GF_SECURITY_ALLOW_EMBEDDING: "true"
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+    networks:
+      - default
+      - otel-net
+
+  msam-tailscale:
+    image: tailscale/tailscale:latest
+    container_name: msam-tailscale
+    restart: unless-stopped
+    hostname: openclaw-msam
+    environment:
+      TS_AUTHKEY: ${TAILSCALE_AUTHKEY}
+      TS_HOSTNAME: openclaw-msam
+      TS_STATE_DIR: /var/lib/tailscale
+    volumes:
+      - msam-tailscale-state:/var/lib/tailscale
+      - ${TAILSCALE_SERVE_CONFIG:-./tailscale-serve.json}:/config/serve.json:ro
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    depends_on:
+      msam-grafana:
+        condition: service_started
+      msam-kg-viewer:
+        condition: service_started
+
+volumes:
+  msam-pgdata:
+  msam-neo4j-data:
+  msam-grafana-data:
+  msam-tailscale-state:
+    name: ${TAILSCALE_VOLUME_NAME:-msam-tailscale-state}
+    external: true
+
+networks:
+  otel-net:
+    external: true
+  dokploy-network:
+    external: true
