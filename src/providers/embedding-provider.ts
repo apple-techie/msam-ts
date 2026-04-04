@@ -26,7 +26,7 @@ export function createEmbeddingProvider(
     case "nvidia-nim":
       return new NvidiaNimProvider(config);
     case "openai":
-      return new OpenAIProvider();
+      return new OpenAIProvider(config);
     case "onnx":
       return new OnnxProvider();
     case "local":

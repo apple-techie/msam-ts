@@ -4,7 +4,7 @@ import cors from "@fastify/cors";
 import { getConfig } from "./config/index.js";
 import { healthCheck } from "./db/connection.js";
 import { storeAtom, getAtomStats, storeWorkingMemory, expireWorkingMemory, recordAccess, deleteAtom, getAtom, updateAtom } from "./core/atoms.js";
-import { getEmbedding } from "./core/embeddings.js";
+import { getEmbedding, configureEmbeddings } from "./core/embeddings.js";
 import { annotateContent, classifyStream } from "./processing/annotate.js";
 import { retrieve } from "./retrieval/strategies.js";
 import { extractTriples, graphTraverse } from "./knowledge/triples.js";
@@ -693,6 +693,15 @@ export async function startServer(opts: { host?: string; port?: number } = {}): 
   const config = getConfig();
   const host = opts.host ?? config.api.host;
   const port = opts.port ?? config.api.port;
+
+  // Initialize embedding provider from config/env
+  configureEmbeddings({
+    provider: (config.embedding.provider as "nvidia-nim" | "openai" | "onnx" | "local") ?? "nvidia-nim",
+    model: config.embedding.model,
+    apiKey: process.env.NVIDIA_NIM_API_KEY ?? process.env.OPENAI_API_KEY ?? config.embedding.api_key ?? undefined,
+    baseUrl: config.embedding.url,
+    dimensions: config.embedding.dimensions,
+  });
 
   const app = await buildApp();
 
