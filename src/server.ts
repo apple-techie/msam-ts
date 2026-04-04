@@ -769,10 +769,14 @@ export async function startServer(opts: { host?: string; port?: number } = {}): 
   const port = opts.port ?? config.api.port;
 
   // Initialize embedding provider from config/env
+  const embeddingProvider = (config.embedding.provider as "nvidia-nim" | "openai" | "onnx" | "local") ?? "nvidia-nim";
+  const embeddingApiKey = embeddingProvider === "nvidia-nim"
+    ? (process.env.NVIDIA_NIM_API_KEY ?? config.embedding.api_key ?? undefined)
+    : (process.env.OPENAI_API_KEY ?? config.embedding.api_key ?? undefined);
   configureEmbeddings({
-    provider: (config.embedding.provider as "nvidia-nim" | "openai" | "onnx" | "local") ?? "nvidia-nim",
+    provider: embeddingProvider,
     model: config.embedding.model,
-    apiKey: process.env.NVIDIA_NIM_API_KEY ?? process.env.OPENAI_API_KEY ?? config.embedding.api_key ?? undefined,
+    apiKey: embeddingApiKey,
     baseUrl: config.embedding.url,
     dimensions: config.embedding.dimensions,
   });
