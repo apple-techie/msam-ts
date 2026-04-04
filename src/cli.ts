@@ -503,7 +503,7 @@ export function registerCommands(program: Command): void {
         coverage: results.length > 0 ? "known" : "unknown",
         atom_count: results.length,
         confidence_distribution: { high: highConf, medium: medConf, low: results.length - highConf - medConf },
-        total_atoms: stats.totalAtoms,
+        total_atoms: stats.total_atoms,
         avg_similarity: results.length > 0
           ? Math.round((results.reduce((s, r) => s + r.similarity, 0) / results.length) * 1000) / 1000
           : 0,

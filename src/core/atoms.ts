@@ -52,14 +52,15 @@ export interface SimilaritySearchParams {
 }
 
 export interface AtomStats {
-  totalAtoms: number;
-  activeAtoms: number;
-  byStream: Record<string, number>;
-  byProfile: Record<string, number>;
-  byState: Record<string, number>;
-  totalAccesses: number;
-  avgActivation: number;
-  estActiveTokens: number;
+  total_atoms: number;
+  active_atoms: number;
+  by_stream: Record<string, number>;
+  by_profile: Record<string, number>;
+  by_state: Record<string, number>;
+  total_accesses: number;
+  avg_activation: number;
+  est_active_tokens: number;
+  db_size_kb: number;
 }
 
 export function contentHash(content: string): string {
@@ -366,14 +367,15 @@ export async function getAtomStats(agentId?: string): Promise<AtomStats> {
   for (const r of stateResult.rows) byState[String(r.state)] = Number(r.count);
 
   return {
-    totalAtoms: Number(totalRow?.count ?? 0),
-    activeAtoms: Number(activeRow?.count ?? 0),
-    byStream,
-    byProfile,
-    byState,
-    totalAccesses: Number(accessRow?.count ?? 0),
-    avgActivation: Number(accessRow?.avg ?? 0),
-    estActiveTokens: Math.floor(Number(tokenRow?.chars ?? 0) / 4),
+    total_atoms: Number(totalRow?.count ?? 0),
+    active_atoms: Number(activeRow?.count ?? 0),
+    by_stream: byStream,
+    by_profile: byProfile,
+    by_state: byState,
+    total_accesses: Number(accessRow?.count ?? 0),
+    avg_activation: Number(accessRow?.avg ?? 0),
+    est_active_tokens: Math.floor(Number(tokenRow?.chars ?? 0) / 4),
+    db_size_kb: 0,
   };
 }
 
