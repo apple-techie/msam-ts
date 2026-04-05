@@ -845,6 +845,39 @@ export async function buildApp(): Promise<FastifyInstance> {
     };
   });
 
+  // ─── GET /v1/entities/aliases ──────────────────────────────────
+
+  app.get("/v1/entities/aliases", { preHandler: verifyApiKey }, async () => {
+    const { getAllAliases } = await import("./knowledge/entity-resolver.js");
+    return { aliases: getAllAliases(), count: Object.keys(getAllAliases()).length };
+  });
+
+  // ─── POST /v1/entities/aliases ─────────────────────────────────
+
+  app.post<{
+    Body: { aliases: Record<string, string> };
+  }>("/v1/entities/aliases", { preHandler: verifyApiKey }, async (request) => {
+    const { addAlias, getAllAliases } = await import("./knowledge/entity-resolver.js");
+    const newAliases = request.body.aliases;
+    for (const [from, to] of Object.entries(newAliases)) {
+      addAlias(from, to);
+    }
+    return { added: Object.keys(newAliases).length, total: Object.keys(getAllAliases()).length };
+  });
+
+  // ─── POST /v1/entities/resolve ─────────────────────────────────
+
+  app.post<{
+    Body: { entities: string[] };
+  }>("/v1/entities/resolve", { preHandler: verifyApiKey }, async (request) => {
+    const { resolveEntity } = await import("./knowledge/entity-resolver.js");
+    const results = request.body.entities.map((e) => ({
+      input: e,
+      resolved: resolveEntity(e),
+    }));
+    return { results };
+  });
+
   return app;
 }
 

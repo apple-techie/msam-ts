@@ -8,6 +8,7 @@ import {
   createEmbeddingProvider,
   type EmbeddingProvider,
 } from "../providers/embedding-provider.js";
+import { resolveTripleEntities } from "./entity-resolver.js";
 
 // ─── LIKE Escape Helper ─────────────────────────────────────────
 
@@ -144,11 +145,16 @@ function parseTriples(text: string, atomId: string): Array<{ atomId: string; sub
     let subj = match[1].trim().replace(/^["']|["']$/g, "");
     let pred = match[2].trim().replace(/^["']|["']$/g, "");
     let obj = match[3].trim().replace(/^["']|["']$/g, "");
-    if (subj.length > 30 || obj.length > 30) continue;
+    if (subj.length > 50 || obj.length > 50) continue;
     if (subj.length < 2 || obj.length < 2 || pred.length < 2) continue;
     pred = pred.toLowerCase().replace(/[^a-z0-9_]/g, "_").replace(/^_+|_+$/g, "");
     if (!pred) continue;
-    result.push({ atomId, subject: subj, predicate: pred, object: obj });
+
+    // Resolve entities to canonical forms
+    const resolved = resolveTripleEntities(subj, pred, obj);
+    if (!resolved) continue;
+
+    result.push({ atomId, subject: resolved.subject, predicate: resolved.predicate, object: resolved.object });
   }
   return result;
 }
