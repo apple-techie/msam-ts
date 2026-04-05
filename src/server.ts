@@ -105,6 +105,12 @@ export async function buildApp(): Promise<FastifyInstance> {
     return metrics;
   });
 
+  // ─── GET / (root health for external validators) ────────────
+
+  app.get("/", async () => {
+    return { status: "ok" };
+  });
+
   // ─── GET /v1/health ─────────────────────────────────────────
 
   app.get("/v1/health", async () => {
