@@ -304,8 +304,10 @@ export async function buildApp(): Promise<FastifyInstance> {
       topics: a.atom.topics ?? [],
     }));
 
-    for (const _a of outputAtoms) {
+    for (const a of outputAtoms) {
       incRetrievalResult(result.tier);
+      // Log access for ACT-R decay calculations
+      recordAccess(a.id, a.score, "task", agent_id).catch(() => {});
     }
 
     const totalTokens = outputAtoms.reduce((sum, a) => sum + Math.max(1, Math.floor(a.content.length / 4)), 0);
@@ -395,12 +397,15 @@ export async function buildApp(): Promise<FastifyInstance> {
           db: dbAdapter,
           embed: getEmbedding,
         });
-        const sectionAtoms = result.atoms.map((a) => ({
-          id: a.atom.id,
-          content: a.atom.content,
-          stream: a.atom.stream ?? "semantic",
-          score: Math.round(a.combinedScore * 1000) / 1000,
-        }));
+        const sectionAtoms = result.atoms.map((a) => {
+          recordAccess(a.atom.id, a.combinedScore, "context", agentId).catch(() => {});
+          return {
+            id: a.atom.id,
+            content: a.atom.content,
+            stream: a.atom.stream ?? "semantic",
+            score: Math.round(a.combinedScore * 1000) / 1000,
+          };
+        });
         return [name, sectionAtoms] as const;
       }),
     );
