@@ -138,15 +138,17 @@ export async function buildApp(): Promise<FastifyInstance> {
   }>("/v1/store", { preHandler: verifyApiKey }, async (request, reply) => {
     const { content, stream, profile, use_llm_annotate, source_type, metadata, agent_id, embedding } = request.body;
 
+    if (!content || typeof content !== "string" || content.trim().length === 0) {
+      return reply.code(400).send({ detail: "Missing or empty content field" });
+    }
+
     if (stream && !VALID_STREAMS.has(stream)) {
       return reply.code(400).send({ detail: `Invalid stream: ${stream}. Must be one of: ${[...VALID_STREAMS].join(", ")}` });
     }
     if (profile && !VALID_PROFILES.has(profile)) {
       return reply.code(400).send({ detail: `Invalid profile: ${profile}. Must be one of: ${[...VALID_PROFILES].join(", ")}` });
     }
-    if (source_type && !VALID_SOURCE_TYPES.has(source_type)) {
-      return reply.code(400).send({ detail: `Invalid source_type: ${source_type}. Must be one of: ${[...VALID_SOURCE_TYPES].join(", ")}` });
-    }
+    // source_type is free-form — msam-bridge sends various types (auto-capture, session_outcome, cron_prompt, etc.)
 
     const annotations = await annotateContent(content, use_llm_annotate);
     const resolvedStream = stream ?? classifyStream(content);
