@@ -51,13 +51,13 @@ function verifyApiKey(request: FastifyRequest, reply: FastifyReply, done: (err?:
 
 const VALID_STREAMS = new Set(["semantic", "episodic", "procedural", "working"]);
 const VALID_PROFILES = new Set(["lightweight", "standard", "full"]);
-const VALID_SOURCE_TYPES = new Set(["api", "conversation", "observation", "reflection", "system"]);
+const VALID_SOURCE_TYPES = new Set(["api", "conversation", "observation", "reflection", "system", "auto-capture", "cron-capture", "routed-capture", "external", "inference", "correction", "shared"]);
 
 // ─── Build App ──────────────────────────────────────────────────
 
 export async function buildApp(): Promise<FastifyInstance> {
   const config = getConfig();
-  const app = Fastify({ logger: true, bodyLimit: 51200 });
+  const app = Fastify({ logger: true, bodyLimit: 524288 }); // 512KB
 
   await app.register(cors, {
     origin: config.api.allowed_origins,
