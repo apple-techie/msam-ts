@@ -126,7 +126,57 @@ export function setTriplesGauge(value: number): void {
   triplesTotal.set(value);
 }
 
+/**
+ * Refresh gauge metrics from the database.
+ * Called periodically and before /v1/metrics scrape.
+ */
+export async function refreshGauges(): Promise<void> {
+  try {
+    const { getDb } = await import("../db/connection.js");
+    const { sql } = await import("drizzle-orm");
+    const db = getDb();
+
+    // Atoms by state/stream/agent
+    const atomRows = await db.execute(
+      sql`SELECT state, stream, agent_id, COUNT(*) as count FROM atoms GROUP BY state, stream, agent_id`
+    );
+    atomsTotal.reset();
+    for (const row of atomRows.rows) {
+      atomsTotal.set(
+        { state: String(row.state), stream: String(row.stream), agent_id: String(row.agent_id) },
+        Number(row.count)
+      );
+    }
+
+    // Triples count
+    const tripleRows = await db.execute(
+      sql`SELECT COUNT(*) as count FROM triples WHERE state = 'active'`
+    );
+    triplesTotal.set(Number((tripleRows.rows[0] as any)?.count ?? 0));
+  } catch {
+    // DB not ready yet — skip
+  }
+}
+
+let _refreshInterval: ReturnType<typeof setInterval> | null = null;
+
+export function startGaugeRefresh(intervalMs = 60_000): void {
+  // Refresh immediately
+  refreshGauges().catch(() => {});
+  // Then periodically
+  _refreshInterval = setInterval(() => refreshGauges().catch(() => {}), intervalMs);
+  _refreshInterval.unref();
+}
+
+export function stopGaugeRefresh(): void {
+  if (_refreshInterval) {
+    clearInterval(_refreshInterval);
+    _refreshInterval = null;
+  }
+}
+
 export async function metricsEndpoint(): Promise<string> {
+  await refreshGauges();
   return register.metrics();
 }
 

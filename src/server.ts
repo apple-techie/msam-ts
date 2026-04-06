@@ -919,6 +919,10 @@ export async function startServer(opts: { host?: string; port?: number } = {}): 
   }
   console.log("Database connection verified");
 
+  // Start periodic gauge refresh (atoms/triples counts from DB)
+  const { startGaugeRefresh } = await import("./metrics/instrumentation.js");
+  startGaugeRefresh(60_000); // refresh every 60s
+
   await app.listen({ host, port });
   console.log(`MSAM REST API server listening on ${host}:${port}`);
   console.log(`  Health check: http://${host}:${port}/v1/health`);
@@ -931,6 +935,8 @@ export async function startServer(opts: { host?: string; port?: number } = {}): 
       process.exit(1);
     }, 10_000);
     forceExit.unref();
+    const { stopGaugeRefresh } = await import("./metrics/instrumentation.js");
+    stopGaugeRefresh();
     const { cancelGraphSync } = await import("./graph/sync.js");
     cancelGraphSync();
     await app.close();
