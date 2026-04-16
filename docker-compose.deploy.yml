@@ -106,6 +106,9 @@ services:
     restart: unless-stopped
     volumes:
       - ./kg-viewer:/app:ro
+      # Externally-synced per-agent triple export (not tracked in git since it's generated data).
+      # Read-only: populates the "All Agents" dropdown and /api/graph?agent_id=... view.
+      - /opt/msam-data/kg-viewer/agent-triples.json:/app/agent-triples.json:ro
     working_dir: /app
     command:
       - node
