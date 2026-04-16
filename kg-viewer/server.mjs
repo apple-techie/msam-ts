@@ -21,7 +21,7 @@ const MSAM_HEADERS = { "Content-Type": "application/json", "X-API-Key": process.
 const POLL_INTERVAL_MS = 300_000; // 5 minutes (was 30s, caused access_log bloat)
 const GRAPH_ACCEL_URL = process.env.GRAPH_ACCEL_URL || "http://msam-graph-accelerator:3902";
 
-const AGENT_TRIPLES_FILE = "/app/agent-triples.json";
+const AGENT_TRIPLES_FILE = process.env.AGENT_TRIPLES_FILE || "/data/agent-triples.json";
 
 function loadAgentData() {
   try {
