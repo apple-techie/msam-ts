@@ -16,15 +16,16 @@
 
 import { Pool } from "pg";
 
-const BATCH_SIZE = 60;
+const BATCH_SIZE = 50;
+const CONCURRENCY = 3;
 const COARSE_TYPES = new Set(["Person", "Organization", "Technology", "Concept", "Location", "Entity", "unknown", null]);
 
-const LLM_URL = process.env.LLM_URL ?? "https://api.openai.com/v1/chat/completions";
-const LLM_MODEL = process.env.LLM_MODEL ?? "gpt-4o-mini";
-const LLM_API_KEY = process.env.OPENAI_API_KEY ?? process.env.LLM_API_KEY;
+const LLM_URL = process.env.LLM_URL || "https://api.openai.com/v1/chat/completions";
+const LLM_MODEL = process.env.LLM_MODEL || "gpt-4o-mini";
+const LLM_API_KEY = process.env.LLM_API_KEY || process.env.OPENAI_API_KEY;
 
 if (!LLM_API_KEY) {
-  console.error("OPENAI_API_KEY (or LLM_API_KEY) required");
+  console.error("LLM_API_KEY (or OPENAI_API_KEY) required");
   process.exit(1);
 }
 
@@ -54,27 +55,59 @@ Input: one entity name per line.
 Output: one line per entity in the format \`NAME\\tTYPE\` — nothing else. No numbering, no prose.`;
 
 async function classifyBatch(names: string[]): Promise<Record<string, string>> {
-  const res = await fetch(LLM_URL, {
-    method: "POST",
-    headers: { Authorization: `Bearer ${LLM_API_KEY}`, "Content-Type": "application/json" },
-    body: JSON.stringify({
-      model: LLM_MODEL,
-      messages: [
-        { role: "system", content: PROMPT },
-        { role: "user", content: names.join("\n") },
-      ],
-      temperature: 0.1,
-      max_tokens: 4000,
-    }),
-  });
+  // Retry 503 (provider rate-limit) and 429 with exponential backoff up to 4 tries.
+  const MAX_RETRIES = 4;
+  let res: Response | null = null;
+  for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+    res = await fetch(LLM_URL, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${LLM_API_KEY}`, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: LLM_MODEL,
+        messages: [
+          { role: "system", content: PROMPT },
+          { role: "user", content: names.join("\n") },
+        ],
+        temperature: 0.1,
+        max_tokens: 4000,
+        stream: false,
+      }),
+    });
+    if (res.status !== 503 && res.status !== 429) break;
+    const backoffMs = 1500 * Math.pow(2, attempt) + Math.floor(Math.random() * 500);
+    await new Promise((r) => setTimeout(r, backoffMs));
+  }
 
-  if (!res.ok) {
-    console.error(`LLM call failed: ${res.status} ${await res.text().catch(() => "")}`);
+  if (!res || !res.ok) {
+    const bodyForLog = res ? await res.text().catch(() => "") : "no response";
+    console.error(`LLM call failed: ${res?.status ?? "?"} ${bodyForLog.slice(0, 200)}`);
     return {};
   }
 
-  const data = (await res.json()) as { choices: Array<{ message: { content: string } }> };
-  const text = data.choices[0]?.message?.content ?? "";
+  // Some proxies return SSE even when we ask for non-streaming; handle both.
+  const bodyText = await res.text();
+  let text = "";
+  if (bodyText.trimStart().startsWith("{")) {
+    try {
+      const data = JSON.parse(bodyText) as { choices: Array<{ message: { content: string } }> };
+      text = data.choices[0]?.message?.content ?? "";
+    } catch (e) {
+      console.error("JSON parse failed:", (e as Error).message);
+      return {};
+    }
+  } else {
+    // SSE: collect .choices[0].delta.content across events
+    for (const line of bodyText.split("\n")) {
+      if (!line.startsWith("data:")) continue;
+      const payload = line.slice(5).trim();
+      if (!payload || payload === "[DONE]") continue;
+      try {
+        const evt = JSON.parse(payload);
+        const delta = evt.choices?.[0]?.delta?.content ?? evt.choices?.[0]?.message?.content;
+        if (typeof delta === "string") text += delta;
+      } catch {}
+    }
+  }
 
   const out: Record<string, string> = {};
   for (const line of text.split("\n")) {
@@ -90,6 +123,9 @@ async function classifyBatch(names: string[]): Promise<Record<string, string>> {
   return out;
 }
 
+// Short all-uppercase tokens are acronyms — preserve them as-is.
+const KNOWN_ACRONYMS = new Set(["AI", "API", "UI", "UX", "SDK", "CLI", "PR", "VC", "LLC", "CEO", "CTO", "CFO", "KB", "DB", "URL", "SQL", "JSON", "SSE", "REST"]);
+
 function normalizeType(t: string): string | null {
   if (!t) return null;
   let cleaned = t.replace(/[^\w-]/g, "_").replace(/_+/g, "_").replace(/^_|_$/g, "");
@@ -97,6 +133,7 @@ function normalizeType(t: string): string | null {
   const parts = cleaned.split(/[_\-]/).filter(Boolean);
   return parts
     .map((p) => {
+      if (KNOWN_ACRONYMS.has(p.toUpperCase())) return p.toUpperCase();
       if (/[a-z]/.test(p) && /[A-Z]/.test(p)) return p; // mixed case — leave alone (SaaS, VC_Firm)
       return p.charAt(0).toUpperCase() + p.slice(1).toLowerCase();
     })
@@ -135,19 +172,32 @@ async function main() {
   const assigned: Record<string, string> = {};
   let processed = 0;
 
+  // Split into batches, then run CONCURRENCY batches in parallel.
+  const batches: string[][] = [];
   for (let i = 0; i < names.length; i += BATCH_SIZE) {
-    const batch = names.slice(i, i + BATCH_SIZE);
-    process.stdout.write(`  batch ${i}-${i + batch.length} ... `);
-    const result = await classifyBatch(batch);
-    let hits = 0;
-    for (const name of batch) {
-      const raw = result[name];
-      const norm = raw ? normalizeType(raw) : null;
-      if (norm) { assigned[name] = norm; hits++; }
-    }
-    processed += batch.length;
-    console.log(`${hits}/${batch.length} classified (total ${processed}/${names.length})`);
+    batches.push(names.slice(i, i + BATCH_SIZE));
   }
+  console.log(`${batches.length} batches of up to ${BATCH_SIZE}, concurrency ${CONCURRENCY}`);
+
+  let nextIdx = 0;
+  async function worker(workerId: number) {
+    while (nextIdx < batches.length) {
+      const idx = nextIdx++;
+      const batch = batches[idx];
+      const t0 = Date.now();
+      const result = await classifyBatch(batch);
+      let hits = 0;
+      for (const name of batch) {
+        const raw = result[name];
+        const norm = raw ? normalizeType(raw) : null;
+        if (norm) { assigned[name] = norm; hits++; }
+      }
+      processed += batch.length;
+      const ms = Date.now() - t0;
+      console.log(`  [w${workerId}] batch ${idx + 1}/${batches.length}: ${hits}/${batch.length} (${ms}ms, total ${processed}/${names.length})`);
+    }
+  }
+  await Promise.all(Array.from({ length: CONCURRENCY }, (_, i) => worker(i + 1)));
 
   console.log(`\nLLM assigned ${Object.keys(assigned).length} types. Applying to DB...`);
 
