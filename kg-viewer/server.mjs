@@ -1,12 +1,8 @@
 /**
  * kg-viewer — Live Knowledge Graph Visualizer
- * 
- * Data sources:
- *   1. MSAM triples (http://127.0.0.1:3901/v1/triples)
- *   2. Goose KG memory (JSONL file, if available)
- * 
- * Polls MSAM every 30s, watches JSONL for live changes.
- * Serves force-directed D3 graph on port 7780.
+ *
+ * Single data source: MSAM triples (http://msam:3901/v1/triples/graph/{entity}).
+ * Polls every POLL_INTERVAL_MS. Serves force-directed D3 graph on port 7780.
  */
 
 import http from "http";
@@ -29,12 +25,6 @@ function loadAgentData() {
     return JSON.parse(fs.readFileSync(AGENT_TRIPLES_FILE, "utf-8"));
   } catch { return null; }
 }
-
-// Optional: Goose KG memory JSONL
-const GOOSE_KG_FILE = path.join(
-  process.env.HOME,
-  ".config/goose/memory/memory.jsonl"
-);
 
 const log = (...args) =>
   console.log(`[kg-viewer ${new Date().toISOString().slice(11, 19)}]`, ...args);
@@ -174,28 +164,7 @@ async function fetchMsamTriples(agentId) {
   }
 }
 
-// ── Goose KG JSONL Parse ─────────────────────────────────────────────────────
-
-function parseGooseKG() {
-  if (!fs.existsSync(GOOSE_KG_FILE)) return { entities: [], relations: [] };
-  try {
-    const lines = fs.readFileSync(GOOSE_KG_FILE, "utf-8").split("\n").filter(Boolean);
-    const entities = [];
-    const relations = [];
-    for (const line of lines) {
-      try {
-        const obj = JSON.parse(line);
-        if (obj.type === "entity") entities.push(obj);
-        else if (obj.type === "relation") relations.push(obj);
-      } catch {}
-    }
-    return { entities, relations };
-  } catch {
-    return { entities: [], relations: [] };
-  }
-}
-
-// ── Merge into unified graph ─────────────────────────────────────────────────
+// ── Build graph from MSAM triples ────────────────────────────────────────────
 
 // Predicates that are noisy/low-value for visualization
 const SKIP_PREDICATES = new Set([
@@ -239,29 +208,11 @@ function resolveEntityType(name, triples, entityTypesMap) {
   return "Entity";
 }
 
-function buildGraph(msamTriples, gooseKG, entityTypesMap) {
+function buildGraph(msamTriples, entityTypesMap) {
   const entityMap = new Map(); // name -> { entityType, observations, source }
   const relations = [];
 
-  // 1. Goose KG entities carry their own types — use them directly.
-  for (const e of gooseKG.entities) {
-    entityMap.set(e.name, {
-      name: e.name,
-      entityType: e.entityType || "Entity",
-      observations: e.observations || [],
-      source: "goose",
-    });
-  }
-  for (const r of gooseKG.relations) {
-    relations.push({
-      from: r.from,
-      to: r.to,
-      relationType: r.relationType,
-      source: "goose",
-    });
-  }
-
-  // 2. Filter MSAM triples.
+  // 1. Filter MSAM triples by SKIP predicates/entities and confidence floor.
   const filteredTriples = msamTriples.filter(
     (t) =>
       !SKIP_PREDICATES.has(t.predicate) &&
@@ -270,7 +221,7 @@ function buildGraph(msamTriples, gooseKG, entityTypesMap) {
       (t.confidence || 0) >= 0.3,
   );
 
-  // 3. Build entities + relations using types from MSAM (source of truth).
+  // 2. Build entities + relations using types from MSAM (source of truth).
   for (const t of filteredTriples) {
     if (!entityMap.has(t.subject)) {
       entityMap.set(t.subject, {
@@ -309,13 +260,23 @@ function buildGraph(msamTriples, gooseKG, entityTypesMap) {
     }
   }
 
+  // 3. Drop orphan entities — those with no visible edges AND no observations.
+  //    These are nodes that made it into the map (usually as a subject whose
+  //    only triples were filtered out) but contribute no information. With
+  //    an observation they still have content worth showing on hover/click.
+  const connected = new Set();
+  for (const rel of relations) { connected.add(rel.from); connected.add(rel.to); }
+  for (const [name, ent] of entityMap) {
+    if (!connected.has(name) && ent.observations.length === 0) {
+      entityMap.delete(name);
+    }
+  }
+
   return {
     entities: [...entityMap.values()],
     relations,
     meta: {
       msamTriples: msamTriples.length,
-      gooseEntities: gooseKG.entities.length,
-      gooseRelations: gooseKG.relations.length,
       filteredEntities: entityMap.size,
       filteredRelations: relations.length,
       updatedAt: new Date().toISOString(),
@@ -360,12 +321,8 @@ function looksLikeEntity(value, predicate) {
 // ── Polling Loop ─────────────────────────────────────────────────────────────
 
 async function refreshGraph() {
-  const [msamResult, gooseKG] = await Promise.all([
-    fetchMsamTriples(),
-    Promise.resolve(parseGooseKG()),
-  ]);
-
-  const newGraph = buildGraph(msamResult.triples, gooseKG, msamResult.entityTypes ?? new Map());
+  const msamResult = await fetchMsamTriples();
+  const newGraph = buildGraph(msamResult.triples, msamResult.entityTypes ?? new Map());
 
   const changed =
     newGraph.meta.filteredEntities !== graphData.meta.filteredEntities ||
@@ -376,7 +333,7 @@ async function refreshGraph() {
   if (changed) {
     log(
       `Graph updated: ${newGraph.entities.length} nodes, ${newGraph.relations.length} edges ` +
-        `(${msamResult.triples.length} MSAM triples, ${gooseKG.entities.length} Goose entities)`
+        `(${msamResult.triples.length} MSAM triples)`
     );
     broadcast(graphData);
   }
@@ -391,23 +348,6 @@ function broadcast(data) {
       res.write(payload);
     } catch {}
   }
-}
-
-// ── Watch Goose KG file for live changes ─────────────────────────────────────
-
-let debounceTimer = null;
-try {
-  if (fs.existsSync(GOOSE_KG_FILE)) {
-    fs.watch(GOOSE_KG_FILE, () => {
-      clearTimeout(debounceTimer);
-      debounceTimer = setTimeout(() => refreshGraph(), 200);
-    });
-    log(`Watching Goose KG: ${GOOSE_KG_FILE}`);
-  } else {
-    log(`Goose KG file not found (${GOOSE_KG_FILE}), MSAM-only mode`);
-  }
-} catch (e) {
-  log(`Could not watch Goose KG: ${e.message}`);
 }
 
 // ── HTML ─────────────────────────────────────────────────────────────────────
@@ -551,6 +491,18 @@ const HTML = `<!DOCTYPE html>
   .filter-action:hover { color: var(--text); border-color: var(--border); }
   #filter-buttons { display: flex; flex-wrap: wrap; gap: 5px; }
   .filter-btn.filtered-out { display: none; }
+
+  #confidence-row {
+    display: flex; align-items: center; gap: 8px; margin-top: 8px;
+    font-size: 9px; text-transform: uppercase; letter-spacing: 0.1em;
+    color: var(--text-dim); font-weight: 600;
+  }
+  #confidence-slider { flex: 1; cursor: pointer; accent-color: #22d3ee; }
+  #confidence-value {
+    font-family: 'JetBrains Mono', monospace; font-size: 10px;
+    color: var(--text); min-width: 30px; text-align: right; text-transform: none;
+    letter-spacing: 0; font-weight: 500;
+  }
   .filter-btn {
     font-size: 10px; font-weight: 500; padding: 3px 9px; border-radius: 20px;
     border: 1px solid transparent; cursor: pointer; transition: all 0.18s;
@@ -586,7 +538,6 @@ const HTML = `<!DOCTYPE html>
     padding: 2px 7px; border-radius: 12px; margin-left: 6px;
   }
   .source-badge.msam { color: #22d3ee; background: rgba(6,182,212,0.12); border: 1px solid rgba(6,182,212,0.25); }
-  .source-badge.goose { color: #a78bfa; background: rgba(139,92,246,0.12); border: 1px solid rgba(139,92,246,0.25); }
 
   .detail-name { font-size: 15px; font-weight: 700; line-height: 1.3; margin-bottom: 14px; word-break: break-word; }
   .detail-section-label {
@@ -636,7 +587,7 @@ const HTML = `<!DOCTYPE html>
   <div class="logo">\u2B21 KNOWLEDGE GRAPH</div>
   <div id="live-dot" title="Live connection status"></div>
   <div id="stats-pill">\u2014 nodes \u00B7 \u2014 edges</div>
-  <div id="source-pill">MSAM + Goose KG</div>
+  <div id="source-pill">MSAM</div>
   <div id="search-wrap">
     <span id="search-icon">\u2315</span>
     <input id="search" type="text" placeholder="Search nodes\u2026" autocomplete="off" spellcheck="false">
@@ -677,6 +628,11 @@ const HTML = `<!DOCTYPE html>
       </div>
     </div>
     <div id="filter-buttons"></div>
+    <div id="confidence-row" title="Hide edges below this confidence threshold">
+      <span>Min conf</span>
+      <input id="confidence-slider" type="range" min="0" max="1" step="0.05" value="0" />
+      <span id="confidence-value">0.00</span>
+    </div>
   </div>
   <div id="detail-section">
     <div id="empty-state">
@@ -734,6 +690,7 @@ let selectedNodeId = null;
 let searchQuery = '';
 let activeFilters = new Set();   // populated from data; starts empty until first render
 let seenTypes = new Set();       // every type we've ever rendered, used to decide whether a type is "new"
+let minConfidence = 0;           // edge-confidence floor; 0 = show all (server already drops conf<0.3)
 let width, height;
 let initialized = false;
 
@@ -794,7 +751,6 @@ function updateGraph(entities, relations, meta) {
 function updateSourcePill() {
   const p = document.getElementById('source-pill');
   const m = rawMeta.msamTriples || 0;
-  const g = rawMeta.gooseEntities || 0;
   p.textContent = m + ' triples';
 }
 
@@ -811,7 +767,7 @@ function buildNodeList() {
 
 function buildLinkList(nodeMap) {
   return rawRelations.filter(r => nodeMap.has(r.from) && nodeMap.has(r.to))
-    .map(r => ({ source: r.from, target: r.to, relationType: r.relationType, rSource: r.source }));
+    .map(r => ({ source: r.from, target: r.to, relationType: r.relationType, rSource: r.source, confidence: r.confidence }));
 }
 
 function buildAndRender() {
@@ -853,7 +809,9 @@ function renderGraph(newIds) {
   const vl = links.filter(l => {
     const s = typeof l.source==='object'?l.source.id:l.source;
     const t = typeof l.target==='object'?l.target.id:l.target;
-    return vi.has(s)&&vi.has(t);
+    if (!vi.has(s) || !vi.has(t)) return false;
+    const conf = (l.confidence == null) ? 1 : l.confidence;
+    return conf >= minConfidence;
   });
 
   const lg = root.append('g');
@@ -1055,6 +1013,16 @@ function installFilterControls() {
   const search = document.getElementById('filter-search');
   if (search) search.addEventListener('input', applyFilterSearch);
 
+  const slider = document.getElementById('confidence-slider');
+  const valueEl = document.getElementById('confidence-value');
+  if (slider && valueEl) {
+    slider.addEventListener('input', () => {
+      minConfidence = parseFloat(slider.value) || 0;
+      valueEl.textContent = minConfidence.toFixed(2);
+      renderGraph([]); runSimulation(); updateSidebarCounts();
+    });
+  }
+
   const allBtn = document.getElementById('filter-all');
   if (allBtn) allBtn.addEventListener('click', () => {
     // Activate every currently-rendered (non-filtered-out) type.
@@ -1087,8 +1055,7 @@ function populateSidebar(d){
   document.getElementById('empty-state').style.display='none';
   const detail=document.getElementById('node-detail');
   detail.classList.add('visible');
-  const srcBadge=d.source==='goose'?'<span class="source-badge goose">Goose KG</span>'
-    :'<span class="source-badge msam">MSAM</span>';
+  const srcBadge='<span class="source-badge msam">MSAM</span>';
   {
     const badgeColor = typeColor(d.entityType);
     const badgeBg = typeBgColor(d.entityType);
@@ -1289,14 +1256,26 @@ const server = http.createServer(async (req, res) => {
       const url = new URL(req.url, "http://localhost");
       const agentId = url.searchParams.get("agent_id") || null;
       const msamResult = await fetchMsamTriples(agentId);
-      const gooseKG = agentId ? { entities: [], relations: [] } : parseGooseKG();
-      const data = buildGraph(msamResult.triples, gooseKG);
+      const data = buildGraph(msamResult.triples, msamResult.entityTypes ?? new Map());
       res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
       res.end(JSON.stringify(data));
     } catch (e) {
       res.writeHead(500, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: e.message }));
     }
+  } else if (req.url === "/favicon.ico") {
+    // Tiny inline SVG favicon — three connected nodes forming the logo glyph.
+    const svg = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">' +
+      '<rect width="32" height="32" rx="6" fill="#0a0a0f"/>' +
+      '<circle cx="16" cy="10" r="3" fill="#22d3ee"/>' +
+      '<circle cx="8" cy="22" r="3" fill="#f59e0b"/>' +
+      '<circle cx="24" cy="22" r="3" fill="#8b5cf6"/>' +
+      '<line x1="16" y1="10" x2="8" y2="22" stroke="#64748b" stroke-width="1.5"/>' +
+      '<line x1="16" y1="10" x2="24" y2="22" stroke="#64748b" stroke-width="1.5"/>' +
+      '<line x1="8" y1="22" x2="24" y2="22" stroke="#64748b" stroke-width="1.5"/>' +
+      '</svg>';
+    res.writeHead(200, { "Content-Type": "image/svg+xml", "Cache-Control": "public, max-age=86400" });
+    res.end(svg);
   } else {
     res.writeHead(404);
     res.end();

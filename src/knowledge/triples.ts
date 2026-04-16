@@ -187,19 +187,28 @@ const TYPE_ALIASES: Record<string, string> = {
   "technologies": "Technology",
   "orgs": "Organization",
   "organizations": "Organization",
+  "company": "Organization",
+  "companies": "Organization",
+  "corporation": "Organization",
+  "enterprise": "Organization",
   "people": "Person",
   "persons": "Person",
   "humans": "Person",
+  "individual": "Person",
   "agents": "Agent",
   "bots": "Bot",
   "ai": "AI_Agent",
+  "ai_agents": "AI_Agent",
   "saas": "SaaS",
   "api": "API",
+  "apis": "API",
   "sdk": "SDK",
   "cli": "CLI",
   "ui": "UI_Component",
   "ux": "UX_Concept",
   "vc": "VC_Firm",
+  "venture_capital": "VC_Firm",
+  "vc_fund": "VC_Firm",
   "llc": "LLC",
   "inc": "Organization",
   "kb": "Knowledge_Base",
@@ -213,6 +222,44 @@ const TYPE_ALIASES: Record<string, string> = {
   "codebases": "Codebase",
   "repos": "Repository",
   "repository": "Repository",
+  "dashboards": "Dashboard",
+  "dataset": "Dataset",
+  "datasets": "Dataset",
+  "file": "File",
+  "files": "File",
+  "directory": "Directory",
+  "directories": "Directory",
+  "docs": "Document",
+  "documents": "Document",
+  "messages": "Message",
+  "emails": "Email",
+  "post": "Post",
+  "posts": "Post",
+  "reel": "Reel",
+  "reels": "Reel",
+  "story": "Story",
+  "stories": "Story",
+  "campaign": "Campaign",
+  "campaigns": "Campaign",
+  "channel": "Channel",
+  "channels": "Channel",
+  "collection": "Collection",
+  "collections": "Collection",
+  "status": "Status",
+  "statuses": "Status",
+  "metric": "Metric",
+  "metrics": "Metric",
+  "contact": "Contact",
+  "contacts": "Contact",
+  "contact_list": "Contact_List",
+  "career": "Role",
+  "career_path": "Role",
+  "sprint": "Event",
+  "deal": "Deal",
+  "deals": "Deal",
+  "frequency": "Metric",
+  "code_concept": "Concept",
+  "industry": "Domain",
 };
 
 function normalizeType(raw: string | undefined): string | null {
@@ -418,6 +465,9 @@ export async function graphTraverse(
       if (visited.has(node)) continue;
       visited.add(node);
 
+      // Case-insensitive exact match using the `lower()` functional indexes
+      // (idx_triples_subject_lower / idx_triples_object_lower). Much faster
+      // than ILIKE which can't benefit from a plain btree index.
       const rows = await db
         .select()
         .from(triples)
@@ -425,8 +475,8 @@ export async function graphTraverse(
           and(
             eq(triples.state, "active"),
             or(
-              ilike(triples.subject, escapeLike(node)),
-              ilike(triples.object, escapeLike(node)),
+              sql`lower(${triples.subject}) = ${node}`,
+              sql`lower(${triples.object}) = ${node}`,
             ),
           ),
         );
@@ -503,8 +553,8 @@ export async function graphPath(
         and(
           eq(triples.state, "active"),
           or(
-            ilike(triples.subject, escapeLike(node)),
-            ilike(triples.object, escapeLike(node)),
+            sql`lower(${triples.subject}) = ${node}`,
+            sql`lower(${triples.object}) = ${node}`,
           ),
         ),
       );
@@ -540,8 +590,8 @@ async function reconstructChain(
         and(
           eq(triples.state, "active"),
           or(
-            and(ilike(triples.subject, escapeLike(a)), ilike(triples.object, escapeLike(b))),
-            and(ilike(triples.subject, escapeLike(b)), ilike(triples.object, escapeLike(a))),
+            and(sql`lower(${triples.subject}) = ${a}`, sql`lower(${triples.object}) = ${b}`),
+            and(sql`lower(${triples.subject}) = ${b}`, sql`lower(${triples.object}) = ${a}`),
           ),
         ),
       )
