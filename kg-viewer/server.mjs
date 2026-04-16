@@ -520,10 +520,37 @@ const HTML = `<!DOCTYPE html>
   #sidebar-counts { font-size: 10px; color: var(--text-dim); margin-top: 4px; font-family: 'JetBrains Mono', monospace; }
   #last-updated { font-size: 10px; color: var(--text-dim); margin-top: 2px; font-family: 'JetBrains Mono', monospace; }
 
-  #filter-section { padding: 10px 16px; border-bottom: 1px solid var(--border); flex-shrink: 0; }
+  #filter-section {
+    padding: 10px 16px; border-bottom: 1px solid var(--border);
+    /* Cap the filter rail so a large dynamic ontology doesn't push the detail pane off-screen.
+       Internally scrollable, detail pane stays reachable. */
+    max-height: 35vh; overflow-y: auto;
+    scrollbar-width: thin; scrollbar-color: #1e1e2e transparent; flex-shrink: 0;
+  }
+  #filter-section::-webkit-scrollbar { width: 4px; }
+  #filter-section::-webkit-scrollbar-thumb { background: #1e1e2e; border-radius: 2px; }
+  #filter-header {
+    display: flex; align-items: center; justify-content: space-between;
+    margin-bottom: 7px; gap: 8px;
+  }
   #filter-label { font-size: 9px; text-transform: uppercase; letter-spacing: 0.1em;
-    color: var(--text-dim); margin-bottom: 7px; font-weight: 600; }
+    color: var(--text-dim); font-weight: 600; }
+  #filter-search {
+    flex: 1; min-width: 0; background: rgba(30,30,46,0.4); border: 1px solid var(--border);
+    border-radius: 14px; padding: 3px 10px; color: var(--text); font-size: 10px;
+    font-family: 'Inter', sans-serif; outline: none;
+  }
+  #filter-search::placeholder { color: var(--text-dim); }
+  #filter-search:focus { border-color: rgba(148,163,184,0.4); }
+  #filter-actions { display: flex; gap: 6px; }
+  .filter-action {
+    font-size: 9px; color: var(--text-dim); background: transparent; border: 1px solid transparent;
+    cursor: pointer; padding: 2px 6px; border-radius: 10px; font-family: 'Inter', sans-serif;
+    text-transform: uppercase; letter-spacing: 0.08em;
+  }
+  .filter-action:hover { color: var(--text); border-color: var(--border); }
   #filter-buttons { display: flex; flex-wrap: wrap; gap: 5px; }
+  .filter-btn.filtered-out { display: none; }
   .filter-btn {
     font-size: 10px; font-weight: 500; padding: 3px 9px; border-radius: 20px;
     border: 1px solid transparent; cursor: pointer; transition: all 0.18s;
@@ -641,7 +668,14 @@ const HTML = `<!DOCTYPE html>
     <div id="last-updated"></div>
   </div>
   <div id="filter-section">
-    <div id="filter-label">Filter by type</div>
+    <div id="filter-header">
+      <span id="filter-label">Filter by type</span>
+      <input id="filter-search" placeholder="filter types…" type="text" />
+      <div id="filter-actions">
+        <button class="filter-action" id="filter-all">All</button>
+        <button class="filter-action" id="filter-none">None</button>
+      </div>
+    </div>
     <div id="filter-buttons"></div>
   </div>
   <div id="detail-section">
@@ -1004,6 +1038,49 @@ function setupFilters(){
     });
     wrap.appendChild(btn);
   }
+
+  // Apply current filter-search text if any.
+  applyFilterSearch();
+}
+
+function applyFilterSearch() {
+  const q = (document.getElementById('filter-search')?.value || '').trim().toLowerCase();
+  for (const btn of document.querySelectorAll('.filter-btn')) {
+    const type = btn.dataset.type || '';
+    btn.classList.toggle('filtered-out', q.length > 0 && !type.toLowerCase().includes(q));
+  }
+}
+
+function installFilterControls() {
+  const search = document.getElementById('filter-search');
+  if (search) search.addEventListener('input', applyFilterSearch);
+
+  const allBtn = document.getElementById('filter-all');
+  if (allBtn) allBtn.addEventListener('click', () => {
+    // Activate every currently-rendered (non-filtered-out) type.
+    for (const btn of document.querySelectorAll('.filter-btn')) {
+      if (btn.classList.contains('filtered-out')) continue;
+      const t = btn.dataset.type;
+      activeFilters.add(t); btn.classList.remove('inactive');
+    }
+    selectedNodeId = null;
+    document.getElementById('empty-state').style.display = '';
+    document.getElementById('node-detail').classList.remove('visible');
+    renderGraph([]); runSimulation(); updateSidebarCounts();
+  });
+
+  const noneBtn = document.getElementById('filter-none');
+  if (noneBtn) noneBtn.addEventListener('click', () => {
+    for (const btn of document.querySelectorAll('.filter-btn')) {
+      if (btn.classList.contains('filtered-out')) continue;
+      const t = btn.dataset.type;
+      activeFilters.delete(t); btn.classList.add('inactive');
+    }
+    selectedNodeId = null;
+    document.getElementById('empty-state').style.display = '';
+    document.getElementById('node-detail').classList.remove('visible');
+    renderGraph([]); runSimulation(); updateSidebarCounts();
+  });
 }
 
 function populateSidebar(d){
@@ -1093,6 +1170,7 @@ function init(){
   svg.on('click',ev=>{if(ev.target===svg.node()||ev.target.tagName==='svg')deselectNode();});
   root=d3.select('#graph-root');
   setupFilters();
+  installFilterControls();
   document.getElementById('search').addEventListener('input',e=>{
     searchQuery=e.target.value.trim().toLowerCase();updateSearchHighlight();
   });
