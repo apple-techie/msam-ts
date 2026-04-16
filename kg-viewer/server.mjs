@@ -58,33 +58,22 @@ async function fetchMsamTriples(agentId) {
       }),
     });
 
-    // Instead, let's use a smarter approach:
-    // Fetch graph neighborhoods for key seed entities
+    // When a specific agent is selected, return only that agent's triples
+    // from the per-agent export (served from /data/agent-triples.json).
+    // NOTE: this path bypasses MSAM's entity_types map, so types fall back
+    // to whatever the export file carries. Safe for filtering but loses
+    // the canonical type view until we plumb types into the export.
     const agentData = loadAgentData();
     if (agentId) {
       if (agentData && agentData.agent_triples && agentData.agent_triples[agentId]) {
-        return { triples: agentData.agent_triples[agentId], stats };
+        return { triples: agentData.agent_triples[agentId], entityTypes: new Map(), stats };
       }
-      return { triples: [], stats };
+      return { triples: [], entityTypes: new Map(), stats };
     }
 
-    // All Agents: aggregate all triples from export file
-    if (agentData && agentData.agent_triples) {
-      const allTriples = [];
-      const seen = new Set();
-      for (const [aid, triples] of Object.entries(agentData.agent_triples)) {
-        for (const t of triples) {
-          const key = t.subject + "|" + t.predicate + "|" + t.object;
-          if (!seen.has(key)) {
-            seen.add(key);
-            allTriples.push(t);
-          }
-        }
-      }
-      if (allTriples.length > 0) {
-        return { triples: allTriples, stats };
-      }
-    }
+    // "All Agents" view: ALWAYS pull from MSAM's graph endpoint so we get the
+    // canonical, up-to-date entity_types. The agent-triples.json export is a
+    // static snapshot and lags behind the LLM reclassification pipeline.
 
     const FALLBACK_SEEDS = [
       "Drew", "Kainotomic", "Enduru AI", "Ryan", "User",
