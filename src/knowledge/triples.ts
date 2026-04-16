@@ -49,13 +49,21 @@ export function classifyQuery(query: string): { type: string; tripleRatio: numbe
 
 // ─── Extraction Prompt ───────────────────────────────────────────
 
-const EXTRACTION_PROMPT = `Extract factual triples (subject, predicate, object) from this memory atom.
+const EXTRACTION_PROMPT = `Extract factual triples from this memory atom. Classify each entity with a type.
 
 ENTITY RULES:
 - Subject/Object must be a NAMED ENTITY (person, organization, tool, system, place, project), max 30 chars
 - Normalize entities: Title_Case with underscores (Andrew_Peltekci, not drew/Drew/DREW)
 - NEVER use "true", "false", "yes", "no", numbers alone, or generic words as objects
 - If about the user's preferences, subject = "User"
+
+ENTITY TYPES — classify each entity as one of:
+  Person        — a specific human (Andrew_Peltekci, Garry_Tan, Sam_Lambert)
+  Organization  — a company, VC firm, LLC, agency (Kainotomic, Comma_Capital, Peltekci_Agency_Inc)
+  Technology    — a tool, platform, SaaS, software, hardware, bot (Vercel, Stripe, Claude, Mac_Studio)
+  Concept       — an abstract noun, role, category, theme (Founder, Investor, Marketing, SEO, Pricing)
+  Location      — a physical place (Los_Angeles, Moreno_Valley)
+  Entity        — fallback for anything else (IDs, file paths, tasks, events)
 
 PREDICATE RULES - USE ONLY THESE PREDICATES:
   Identity: is_founder_of, is_member_of, has_role, is_instance_of, is_type_of
@@ -77,7 +85,13 @@ Atom content:
 {content}
 
 Output format (one per line, or SKIP):
-(subject, predicate, object)`;
+(subject [Type], predicate, object [Type])
+
+Examples:
+(Andrew_Peltekci [Person], is_founder_of, Kainotomic [Organization])
+(Enduru [Technology], deployed_on, Mac_Studio [Technology])
+(User [Person], prefers, Dark_Mode [Concept])
+(Andrew_Peltekci [Person], scheduled_for, Outlander_VC_1:1_Intro_Call [Entity])`;
 
 // ─── Triple ID ───────────────────────────────────────────────────
 
@@ -137,14 +151,38 @@ function getLlmConfig(): { url: string; model: string; apiKey: string } | null {
 
 // ─── Parse LLM Output ───────────────────────────────────────────
 
-function parseTriples(text: string, atomId: string): Array<{ atomId: string; subject: string; predicate: string; object: string }> {
-  const result: Array<{ atomId: string; subject: string; predicate: string; object: string }> = [];
-  const pattern = /\(([^,]+),\s*([^,]+),\s*([^)]+)\)/g;
+const VALID_TYPES = new Set(["Person", "Organization", "Technology", "Concept", "Location", "Entity"]);
+
+function normalizeType(raw: string | undefined): string | null {
+  if (!raw) return null;
+  const cleaned = raw.trim().replace(/^\[|\]$/g, "").trim();
+  // Title-case: first letter uppercase, rest lowercase
+  const title = cleaned.charAt(0).toUpperCase() + cleaned.slice(1).toLowerCase();
+  return VALID_TYPES.has(title) ? title : null;
+}
+
+type ParsedTriple = {
+  atomId: string;
+  subject: string;
+  subjectType: string | null;
+  predicate: string;
+  object: string;
+  objectType: string | null;
+};
+
+function parseTriples(text: string, atomId: string): ParsedTriple[] {
+  const result: ParsedTriple[] = [];
+  // Typed pattern: (subject [Type], predicate, object [Type])
+  // Also matches legacy untyped (subject, predicate, object) via optional [Type] groups.
+  const typedPattern = /\(\s*([^,\[\]()]+?)\s*(?:\[([^\]]+)\])?\s*,\s*([^,\[\]()]+?)\s*,\s*([^,\[\]()]+?)\s*(?:\[([^\]]+)\])?\s*\)/g;
   let match: RegExpExecArray | null;
-  while ((match = pattern.exec(text)) !== null) {
+  while ((match = typedPattern.exec(text)) !== null) {
     let subj = match[1].trim().replace(/^["']|["']$/g, "");
-    let pred = match[2].trim().replace(/^["']|["']$/g, "");
-    let obj = match[3].trim().replace(/^["']|["']$/g, "");
+    const subjType = normalizeType(match[2]);
+    let pred = match[3].trim().replace(/^["']|["']$/g, "");
+    let obj = match[4].trim().replace(/^["']|["']$/g, "");
+    const objType = normalizeType(match[5]);
+
     if (subj.length > 50 || obj.length > 50) continue;
     if (subj.length < 2 || obj.length < 2 || pred.length < 2) continue;
     pred = pred.toLowerCase().replace(/[^a-z0-9_]/g, "_").replace(/^_+|_+$/g, "");
@@ -154,7 +192,14 @@ function parseTriples(text: string, atomId: string): Array<{ atomId: string; sub
     const resolved = resolveTripleEntities(subj, pred, obj);
     if (!resolved) continue;
 
-    result.push({ atomId, subject: resolved.subject, predicate: resolved.predicate, object: resolved.object });
+    result.push({
+      atomId,
+      subject: resolved.subject,
+      subjectType: subjType,
+      predicate: resolved.predicate,
+      object: resolved.object,
+      objectType: objType,
+    });
   }
   return result;
 }
@@ -196,8 +241,10 @@ export async function extractTriples(atomId: string, content: string): Promise<n
     try {
       await storeTriple({
         subject: t.subject,
+        subjectType: t.subjectType ?? undefined,
         predicate: t.predicate,
         object: t.object,
+        objectType: t.objectType ?? undefined,
         atomId: t.atomId,
         agentId: "default",
         confidence: 1.0,
@@ -212,8 +259,10 @@ export async function extractTriples(atomId: string, content: string): Promise<n
 
 export async function storeTriple(triple: {
   subject: string;
+  subjectType?: string;
   predicate: string;
   object: string;
+  objectType?: string;
   atomId: string;
   agentId: string;
   confidence: number;
@@ -228,8 +277,10 @@ export async function storeTriple(triple: {
     id,
     atomId: triple.atomId,
     subject: triple.subject,
+    subjectType: triple.subjectType ?? null,
     predicate: triple.predicate,
     object: triple.object,
+    objectType: triple.objectType ?? null,
     confidence: triple.confidence,
     state: "active",
     embedding,
@@ -266,7 +317,11 @@ export async function getTriples(params: {
 export async function graphTraverse(
   entity: string,
   hops = 3,
-): Promise<{ entities: string[]; relations: Triple[] }> {
+): Promise<{
+  entities: string[];
+  entity_types: Record<string, string>;
+  relations: Triple[];
+}> {
   const db = getDb();
   const visited = new Set<string>();
   let frontier = new Set([entity.toLowerCase()]);
@@ -302,13 +357,35 @@ export async function graphTraverse(
     frontier = new Set([...nextFrontier].filter((n) => !visited.has(n)));
   }
 
+  // Collect distinct entity names and resolve a single type per entity.
+  // Majority vote across all mentions; ties broken by first-seen.
   const entities = new Set<string>();
+  const typeVotes: Map<string, Map<string, number>> = new Map();
   for (const t of allTriples) {
     entities.add(t.subject);
     entities.add(t.object);
+    if (t.subjectType) {
+      const m = typeVotes.get(t.subject) ?? new Map();
+      m.set(t.subjectType, (m.get(t.subjectType) ?? 0) + 1);
+      typeVotes.set(t.subject, m);
+    }
+    if (t.objectType) {
+      const m = typeVotes.get(t.object) ?? new Map();
+      m.set(t.objectType, (m.get(t.objectType) ?? 0) + 1);
+      typeVotes.set(t.object, m);
+    }
+  }
+  const entity_types: Record<string, string> = {};
+  for (const [name, votes] of typeVotes) {
+    let best: string | null = null;
+    let bestCount = 0;
+    for (const [type, count] of votes) {
+      if (count > bestCount) { bestCount = count; best = type; }
+    }
+    if (best) entity_types[name] = best;
   }
 
-  return { entities: [...entities], relations: allTriples };
+  return { entities: [...entities], entity_types, relations: allTriples };
 }
 
 export async function graphPath(
@@ -505,8 +582,10 @@ function rowToTriple(row: typeof triples.$inferSelect): Triple {
     id: row.id,
     atomId: row.atomId,
     subject: row.subject,
+    subjectType: row.subjectType ?? null,
     predicate: row.predicate,
     object: row.object,
+    objectType: row.objectType ?? null,
     confidence: row.confidence ?? 1.0,
     state: row.state ?? "active",
     embedding: row.embedding,

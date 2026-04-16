@@ -357,8 +357,10 @@ export const triples = pgTable(
       .notNull()
       .references(() => atoms.id, { onDelete: "cascade" }),
     subject: text("subject").notNull(),
+    subjectType: text("subject_type"), // Person | Organization | Technology | Concept | Location | Entity
     predicate: text("predicate").notNull(),
     object: text("object").notNull(),
+    objectType: text("object_type"),
     confidence: real("confidence").default(1.0),
     state: text("state", { enum: ["active", "tombstone"] }).default("active"),
     embedding: vector("embedding", { dimensions: 1536 }),
@@ -370,6 +372,8 @@ export const triples = pgTable(
     index("idx_triples_object").on(t.object),
     index("idx_triples_atom").on(t.atomId),
     index("idx_triples_state").on(t.state),
+    index("idx_triples_subject_type").on(t.subjectType),
+    index("idx_triples_object_type").on(t.objectType),
   ],
 );
 

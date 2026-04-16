@@ -40,8 +40,10 @@ export interface Triple {
   id: string;
   atomId: string;
   subject: string;
+  subjectType: string | null;
   predicate: string;
   object: string;
+  objectType: string | null;
   confidence: number;
   state: "active" | "tombstone";
   embedding: number[] | null;

@@ -126,6 +126,7 @@ async function fetchMsamTriples(agentId) {
     }
 
     const allTriples = new Map();
+    const entityTypes = new Map(); // name -> { type: string, votes: number }
 
     await Promise.all(
       seeds.map(async (entity) => {
@@ -148,17 +149,28 @@ async function fetchMsamTriples(agentId) {
               allTriples.set(key, t);
             }
           }
+          // Capture per-entity types from MSAM's graphTraverse response
+          if (data.entity_types && typeof data.entity_types === "object") {
+            for (const [name, type] of Object.entries(data.entity_types)) {
+              if (!type) continue;
+              const existing = entityTypes.get(name);
+              if (!existing || existing.type === type) {
+                entityTypes.set(name, { type, votes: (existing?.votes ?? 0) + 1 });
+              }
+            }
+          }
         } catch {}
       })
     );
 
     return {
       triples: [...allTriples.values()],
+      entityTypes,
       stats,
     };
   } catch (e) {
     log("MSAM fetch failed:", e.message);
-    return { triples: [], stats: null };
+    return { triples: [], entityTypes: new Map(), stats: null };
   }
 }
 
@@ -199,11 +211,39 @@ const SKIP_ENTITIES = new Set([
   "unknown", "N/A", "n/a", "",
 ]);
 
-function buildGraph(msamTriples, gooseKG) {
-  const entityMap = new Map(); // name -> { type, observations, sources }
+/**
+ * Per-triple entity type resolver.
+ *
+ * Priority:
+ *   1. Type from MSAM `entity_types` map (populated from triples.subject_type /
+ *      object_type columns, which are LLM-assigned at extraction time).
+ *   2. Per-triple type carried on the relation itself (`subjectType`/`objectType`
+ *      fields from MSAM's /v1/triples/graph response).
+ *   3. Fallback "Entity" for triples whose entities haven't been typed yet
+ *      (pre-Plan-B data that the backfill missed).
+ *
+ * There is no pattern matching here. Types are source-of-truth from MSAM.
+ */
+function resolveEntityType(name, triples, entityTypesMap) {
+  // 1. MSAM's graphTraverse-resolved map (majority vote across all known triples)
+  const fromMap = entityTypesMap.get(name);
+  if (fromMap?.type) return fromMap.type;
+
+  // 2. Per-triple annotation (first seen wins since the map above already votes)
+  for (const t of triples) {
+    if (t.subject === name && t.subjectType) return t.subjectType;
+    if (t.object === name && t.objectType) return t.objectType;
+  }
+
+  // 3. Untyped — schedule for backfill or next LLM re-extraction
+  return "Entity";
+}
+
+function buildGraph(msamTriples, gooseKG, entityTypesMap) {
+  const entityMap = new Map(); // name -> { entityType, observations, source }
   const relations = [];
 
-  // 1. Add Goose KG entities (these have rich types + observations)
+  // 1. Goose KG entities carry their own types — use them directly.
   for (const e of gooseKG.entities) {
     entityMap.set(e.name, {
       name: e.name,
@@ -212,8 +252,6 @@ function buildGraph(msamTriples, gooseKG) {
       source: "goose",
     });
   }
-
-  // 2. Add Goose KG relations
   for (const r of gooseKG.relations) {
     relations.push({
       from: r.from,
@@ -223,31 +261,21 @@ function buildGraph(msamTriples, gooseKG) {
     });
   }
 
-  // 3. Filter MSAM triples and collect per-entity evidence for type voting
-  const entityEvidence = new Map(); // name -> [{ predicate, role }]
-  const filteredTriples = [];
+  // 2. Filter MSAM triples.
+  const filteredTriples = msamTriples.filter(
+    (t) =>
+      !SKIP_PREDICATES.has(t.predicate) &&
+      !SKIP_ENTITIES.has(t.subject) &&
+      !SKIP_ENTITIES.has(t.object) &&
+      (t.confidence || 0) >= 0.3,
+  );
 
-  for (const t of msamTriples) {
-    if (SKIP_PREDICATES.has(t.predicate)) continue;
-    if (SKIP_ENTITIES.has(t.subject) || SKIP_ENTITIES.has(t.object)) continue;
-    if ((t.confidence || 0) < 0.3) continue;
-    filteredTriples.push(t);
-
-    if (!entityEvidence.has(t.subject)) entityEvidence.set(t.subject, []);
-    entityEvidence.get(t.subject).push({ predicate: t.predicate, role: "subject" });
-
-    if (looksLikeEntity(t.object, t.predicate)) {
-      if (!entityEvidence.has(t.object)) entityEvidence.set(t.object, []);
-      entityEvidence.get(t.object).push({ predicate: t.predicate, role: "object" });
-    }
-  }
-
-  // 4. Build entities + relations using accumulated evidence (fixes first-triple-wins bug)
+  // 3. Build entities + relations using types from MSAM (source of truth).
   for (const t of filteredTriples) {
     if (!entityMap.has(t.subject)) {
       entityMap.set(t.subject, {
         name: t.subject,
-        entityType: inferType(t.subject, entityEvidence.get(t.subject) || []),
+        entityType: resolveEntityType(t.subject, filteredTriples, entityTypesMap),
         observations: [],
         source: "msam",
       });
@@ -257,7 +285,7 @@ function buildGraph(msamTriples, gooseKG) {
       if (!entityMap.has(t.object)) {
         entityMap.set(t.object, {
           name: t.object,
-          entityType: inferType(t.object, entityEvidence.get(t.object) || []),
+          entityType: resolveEntityType(t.object, filteredTriples, entityTypesMap),
           observations: [],
           source: "msam",
         });
@@ -321,272 +349,13 @@ function looksLikeEntity(value, predicate) {
   return false;
 }
 
-// Predicates that imply the SUBJECT is a person
-const PERSON_AS_SUBJECT = new Set([
-  "founder", "cofounder", "co_founder", "partner", "works_with",
-  "contacted", "replied", "investor", "recipient", "manages",
-  "collaborates_with", "reports_to", "has_role", "backed",
-  "invested_in", "consulting_client", "prefers", "likes", "dislikes",
-  "uses", "follows", "subscribes_to",
-]);
+// Entity typing is now MSAM's responsibility. See:
+//   src/knowledge/triples.ts              — LLM extracts types at ingestion
+//   src/db/schema.ts                      — triples.subject_type / object_type
+//   patches/graph-accelerator/            — propagates types to Neo4j labels
+//
+// This file consumes the resulting types; it no longer infers them.
 
-// Predicates that imply the OBJECT is a person
-const PERSON_AS_OBJECT = new Set([
-  "founder", "cofounder", "co_founder", "partner", "works_with",
-  "contacted", "replied", "investor", "recipient", "manages",
-  "collaborates_with", "reports_to", "consulting_client",
-  "target_audience",
-]);
-
-// Predicates that imply the OBJECT is technology
-const TECH_AS_OBJECT = new Set([
-  "uses", "running_on", "deployed_on", "depends_on", "integrates_with",
-  "connects_to", "configured_with", "runs_on",
-]);
-
-// Predicates that imply the SUBJECT is technology/infrastructure
-const TECH_AS_SUBJECT = new Set([
-  "running_on", "deployed_on", "runs_on", "depends_on",
-  "integrates_with", "connects_to",
-]);
-
-// =====================================================================
-// ENTITY TYPE CLASSIFIER
-// All keys are lowercase with spaces → underscores (matches `lname`).
-// =====================================================================
-
-// Explicit known people (verified real humans)
-const PERSON_NAMES = new Set([
-  "andrew_peltekci", "drew", "andrew", "mr_peltekci", "dad", "drews_dad",
-  "sister", "family", "__tosh",
-  "abdul", "abdul_muhaimin", "abdul_muhaimin_al_nassar", "abhinav_asthana",
-  "adam", "adam_gross", "aimee", "alex_maccaw", "alycia_setlin",
-  "amir_s", "amir_sheva", "amir_shevat", "amit_kumar_yadav", "amjad_masad",
-  "andre", "andy", "ash", "ash_rust", "ashish", "ashish_parmar",
-  "avlok_kohli", "ayush_katheriya",
-  "ben_tossell", "bobby_tables", "brittany_carter",
-  "charles_hudson", "chris", "chris_haywood", "chue",
-  "dexter", "david_kimani", "david_ongchoco", "davis_mironga",
-  "ed_sim", "eduardo_cruz", "elad_gil", "elizabeth_yin", "erin", "evan_steinberg",
-  "fahad_islam", "faraz_khan", "francesco_ciampallari", "franco", "franco_cas",
-  "garry_tan", "gary_benerofe", "georgi_sharliyski", "gerardo_aguirre",
-  "grant", "greg_irwin", "guillermo_rauch",
-  "heather_stoddard", "henry", "ian_mccrystal",
-  "james_currier", "jason_calacanis", "joe", "joey", "joey_foldi", "joey_raptis",
-  "john_borthwick", "jordan_kretchmer", "joshua", "jozsef_foldi", "justin", "justin_walker",
-  "kimberly", "lachy_groom", "leura_craig",
-  "mannsullar_bryant", "marcos", "maricela", "mark_fulton", "mathias_biilmann",
-  "mayra", "megan_alford", "michael_biilmann", "michael_ulin", "mike_hsieh", "mjjui",
-  "paige_craig", "patrick_thompson", "paul_bricault", "phin_barnes",
-  "reuven_cohen", "richard_socher", "rob_hayes", "robert_herjavec", "roy_bahat",
-  "ryan", "ryan_callaghan", "ryan_hoover",
-  "sahil_lavingia", "sam", "sam_lambert", "sannidhya", "sannidhya_sah",
-  "sherrise_pond", "shivam_kumar",
-  "spencer_kimbal", "spencer_kimball", "stanislav_beliaev", "sumeet_gajri",
-  "sumeet_singh", "sunny",
-  "thomas_schranz", "tim_hsia", "todd_saunders", "tomas_tunguz", "tomasz_tunguz",
-  "tosh_velaga", "tsvetan_karakanov", "turner_novak",
-  "vic", "victor", "victor_quinones", "william_hsu",
-]);
-
-// Explicit technologies/brands
-const TECH_NAMES = new Set([
-  "adobe", "anthropic", "apple_card", "apple_platforms", "apple_techie",
-  "bot", "cal_com", "calendly", "camoufox", "carbon_ads", "chase",
-  "claude", "claude_code", "claude_code_autonomy", "claude_code_plugin", "claude_opus",
-  "clawmetry", "clawmetry_fork", "clerk",
-  "docker_compose", "docker_mc", "dokploy_root",
-  "facebook", "facebook_ads", "facebook_feed", "facebook_marketplace",
-  "facebook_messenger", "facebook_reel", "facebook_story",
-  "facebook_marketplace_messages", "facebook_marketplace_threads",
-  "fb_messenger", "fb_marketplace_automation",
-  "github", "github_copilot", "gmail", "gog_gmail", "gog_gmail_search",
-  "google_account", "google_ads", "google_analytics", "google_authentication",
-  "google_calendar", "google_chrome", "google_payments", "google_play",
-  "google_policy", "google_review", "google_security", "google_ads_campaigns",
-  "google_ads_rebuild", "grafana", "gstack",
-  "hydra", "imac", "instagram", "instagram_feed", "instagram_reel", "instagram_story",
-  "linkedin", "linkedin_post", "linkedin_audience",
-  "mac_studio", "mac_studio_export_script", "macbook_pro_node",
-  "mailgun_domain", "mem0", "meta_pixel", "meta_voice_operations", "mission_control",
-  "mv_dashboard", "nemoclaw_fork", "neo4j", "neo4j_graph_accelerator",
-  "notion", "openclaw", "openclaw.app", "openclaw_browser", "openclaw_runtime",
-  "openclaw_gateway", "openclaw_agent", "openclaw_dokploy", "openclaw_fork",
-  "openclaw_demo_command_center", "openclaw_site_health_check",
-  "openrouter", "oracle_cloud", "otel", "otel/grafana",
-  "pi_mono", "portainer", "react", "react_18", "react_19",
-  "reddit", "old_reddit", "rolex", "signal", "signetai_fork", "sqlite",
-  "stripe", "stripe_atlas", "stripe_checkout", "stripe_keys", "stripe_test_mode",
-  "supabase", "supabase_auth", "supabase_realtime", "tailscale_serve",
-  "telegram", "toyota", "twitter", "twitter_account", "twitter_content_am",
-  "twitter_user", "twitter_crons", "x/twitter",
-  "ubuntu-root", "ubuntu_root", "vercel", "vitest", "whatsapp",
-  "you.com", "hubspot",
-  "signoz_mcp_server", "silver_price", "gold_price", "gold_pricing",
-  "gold_widget", "gold_widget_fix", "price_widget",
-  "keychain_access", "keychain_dialog", "keychain_item",
-  "dashboard_server", "mv_landing",
-  "linux_enduru", "serverless_postgres", "aurora_orchestrator", "aurora_worker",
-  "worker_chain", "aurora", "turkules", "system",
-  "macos_companion_app", "mc_gateways", "imessage_fda_block",
-  "craigslist_listings", "craigslist_account", "r_vibecoding", "kryakrya_it",
-  "synced_messages", "sessions_spawn", "firewall_security",
-  "signal_export", "signal_keychain", "gateways",
-]);
-
-// Explicit organizations
-const ORG_NAMES = new Set([
-  "aix_ventures", "amplify_la", "anthemis_group", "banana_capital", "betaworks",
-  "belgium_new_york_llc", "comma_capital", "cofounded_llc", "crown_gold_exchange",
-  "devry_cyber_security_club", "e-cig_city_upland", "enduru", "enduru_ai",
-  "factory", "fabiolus_cucina", "finestar", "first_round", "hustle_fund",
-  "kainotomic", "kaino", "kaino_dev", "letsdisagree", "leso_studios",
-  "mu_ventures", "nfx", "mv_jewelry_exchange", "outlander_vc",
-  "peltekci_agency_inc", "precursor_ventures", "prismetric", "sterling_road",
-  "urbane_cafe", "whimsey_labs", "alcoholics_anonymous", "awaken_altadena",
-  "cash_for_gold_nova", "tech_company",
-]);
-
-// Explicit concept/role nouns (including plurals)
-const CONCEPT_NAMES = new Set([
-  "agent", "agents", "assistant", "bot", "founder", "founders",
-  "investor", "investors", "sellers", "stylists", "estheticians",
-  "team", "team_member", "staff", "coworkers", "leads", "roles",
-  "decision_maker", "investor_1", "investor_2", "legal_counsel",
-  "business_owners", "enterprise_clients", "potential_investors",
-  "independent_consultant", "independent_contractors",
-  "industry_contacts", "industry_professionals", "seasoned_professional",
-  "senior_partner", "senior_solutions_architect",
-  "software_engineer", "solutions_architect", "managing_partner",
-  "general_partners", "google_engineers", "uber_engineers",
-  "facebook_engineers", "spanish_speakers", "dashboard_administrator",
-  "nail_techs", "technical_role", "ai_contractor", "cofounded",
-  "founder_journey", "content_guardian", "community_agent",
-  "content_agent", "outreach_agent", "department_agent", "marketing_agent",
-  "main_agent", "department_heads", "mv-marketing_agent", "mv-ops_agent",
-  "mv-data_agent", "mv_marketing", "mv-marketing", "mv-data", "mv-ops",
-  "mv-product", "agentic_cli", "agentic_era", "coding_agents",
-  "aha_moment", "ultimate_brain", "social_media", "premium_subscription",
-  "silver_bullion", "gold_jewelry", "estate_jewelry",
-  // Single-word business/role nouns that look like names but aren't
-  "platform", "campaigns", "content", "seo", "pricing", "ads", "social",
-  "outreach", "reporting", "qa", "marketing", "ops", "pm", "prs", "agencies",
-  "listings", "accelerator", "warmth", "c_output", "spearmint_rhino_cfo",
-  "llc", "agent_runtime", "reddit_user", "ok_activity_4626",
-]);
-
-// Known locations → Entity (no Location type in the UI)
-const LOCATION_NAMES = new Set([
-  "moreno_valley", "san_bernardino", "west_covina", "los_angeles",
-  "inland_empire", "united_states", "altadena_strong",
-  "affordable_housing",
-]);
-
-// Brand prefixes → Technology (compound names starting with these)
-const TECH_PREFIX_RE = /^(facebook[_-]|instagram[_-]|twitter[_-]|x\/twitter|google[_-]|linkedin[_-]|reddit|apple[_-]|telegram[_-]|whatsapp[_-]|signal[_-]|claude[_-]|mem0|hydra|openclaw|fb[_-]|meta[_-]|notion[_-]|trello[_-]|slack[_-]|discord[_-]|stripe[_-]|supabase[_-]|clerk[_-]|vercel[_-]|neo4j[_-]|docker[_-]|dokploy[_-]|kubernetes[_-]|redis[_-]|gmail[_-]?|github[_-]|gitlab[_-]|gateway[_-]|dashboard[_-]|heartbeat[_-]|cron[_-]|browser[_-]|marketplace[_-]|listing[_-]|listings[_-]|payment[_-]|pricing[_-]|lead[_-]|leads[_-]|website[_-]|webhook[_-]|otel|oauth|jwt[_-]|openrouter|anthropic|rolex|kainotomic[_-]|enduru[_-]|turkules[_-]|tipjars?[_-]?|kaino[_-]|mv[_-]|mv\.|newsfetch[_-]?|remotion[_-]?|platform[_-]|news[_-])/i;
-
-// Organization-like suffixes (e.g. Comma_Capital, Cofounded_LLC)
-const ORG_SUFFIX_RE = /_(llc|inc|corp|co|ltd|capital|ventures|group|fund|labs|studios|agency|cafe|exchange|club)$/i;
-
-// Role/concept suffixes (plural people-nouns, org-roles)
-const CONCEPT_SUFFIX_RE = /_(agents?|engineers?|owners?|contractors?|partners?|clients?|users?|members?|techs?|technicians?|professionals?|consultants?|architects?|workers?|admins?|team|staff|leads?|roles?|bots?|assistants?|guardians?|administrators?|heads?|stylists?|estheticians?|sellers?|followers?|buyers?|subscribers?)$/i;
-
-// Content/post suffixes → Entity
-const CONTENT_SUFFIX_RE = /_(post|posts|reel|reels|story|stories|feed|feeds|ads|ad|campaign|campaigns|draft|drafts|summary|report|reports|note|notes|update|updates|hook|graphic|pitch_deck|tweet_draft|draft_tweet|deck)$/i;
-
-// Technology/system suffixes → Technology
-const TECH_SUFFIX_RE = /_(tool|tools|service|service[_-]?mesh|system|engine|platform|runtime|gateway|gateways|server|client|protocol|api|database|schema|table|sdk|cli|bot|script|wrapper|extractor|manager|controller|dashboard|panel|widget|widgets|automation|pipeline|workflow|workflows|sync|cron|crons|jobs|job|backup|export|refresh|monitoring|analytics|calendar|email|chat|messenger|threads|thread|conversations|signaling|validation|verification|execution|health|rebuild|reset|filter|prompt|migration|deployment|installation|configuration|infrastructure|layer|node|nodes|host|oracle|container|containers|repository|repositories|repos|app|apps|block|blocks)$/i;
-
-// Entity-like suffixes → Entity (generic things)
-const ENTITY_SUFFIX_RE = /_(page|pages|slug|fork|forks|pathway|feature|features|tracking|check|checks|plan|plans|board|boards|state|config|wiki|logs|content|catalog|template|rules|endpoint|endpoints|status|request|response|tests|test|review|reviews|account|accounts|chain|cleanup|onboarding|identity|dialog|week|weekend|morning|evening|daily|weekly|monthly|removals|additions|tasks|task|project|projects|error|errors|snapshot|bundle|trust|context|execution|dark_mode|mode|story|stories|pool|space|spawn|renewal|renewals|targets|target|debt|messages|message|security|health)$/i;
-
-// Contains a tech brand anywhere in name → Technology (except for explicit persons)
-const CONTAINS_BRAND_RE = /\b(gmail|facebook|instagram|twitter|linkedin|reddit|youtube|apple|microsoft|amazon|stripe|supabase|vercel|clerk|notion|trello|slack|discord|telegram|whatsapp|claude|chatgpt|anthropic|openai|docker|kubernetes|redis|mongodb|postgresql|mysql|sqlite|neo4j|grafana|tailscale|dokploy|portainer|github|gitlab|heroku|netlify|aws|azure|gcp|cloudflare|chrome|firefox|safari|edge|bun|deno|node|react|vue|angular|next|nuxt|express|fastify|webpack|vite)\b/i;
-
-// Prefixes that disqualify a compound name from being classified as a Person.
-// These are domain/tech/abstract-concept words that appear as the first token in
-// compound names but aren't given names.
-const NOT_PERSON_PREFIX_RE = /^(access|admin|agent|agentic|agents|ai|aios|all|allocation|api|app|approval|apps|architecture|audit|auth|automated|automation|aurora|backend|backup|batch|begin|behind|best|bi|blacklist|blog|book|browser|budget|builder|bulk|business|cache|campaign|canonical|card|carson|cash|change|channel|chat|claude|clarifying|client|code|coding|command|companion|consistent|content|context|contract|coworker|credit|critical|cross|crown|cron|dad|daily|dark|dashboard|data|database|deal|deals|debug|decision|decomposition|deep|delivery|demo|department|deploy|design|dev|development|device|disk|docker|dokploy|domain|done|draft|dual|dynamic|e2e|edit|educational|email|empty|end|engaged|engagement|enterprise|environment|error|escalation|established|estate|evening|exec|execution|existing|expertise|external|failure|family|feature|file|filter|final|first|fix|flex|fluff|font|form|full|gateway|get|global|gold|gratisfaction|grid|hacker|headless|heartbeat|high|host|hot|human|imessage|important|in|independent|industry|initial|inland|input|installed|internal|interview|investor|issue|jar|jewelry|job|kaino|kainotomic|kevin|keychain|keyword|kryakrya|large|launch|lead|leads|legal|lightweight|linkedin|listing|listings|live|load|loading|local|lock|logs|loose|low|machine|mac|macbook|macos|main|managed|managing|market|marketing|marketplace|mc|mem|memory|messaging|message|meta|migration|milestone|minimal|mission|model|monday|monetization|morning|msam|multi|new|news|newsfetch|node|notes|notion|ok|old|onboarding|op|open|openclaw|operating|ops|oracle|orchestrator|outreach|package|path|payment|payments|pawn|peltekci|performance|performative|personal|phase|pi|pitch|platform|pm|pmax|pocket|port|postgres|potential|pr|preview|previous|price|pricing|primary|priority|privacy|product|production|project|projects|public|pull|purchase|python|qa|queryable|r|rails|real|recurring|redundant|reimbursement|release|remotion|rendering|reporting|repository|request|resource|response|rest|review|role|route|routing|ryan|sample|sandbox|scheduling|schema|script|search|secret|secondary|security|seo|session|sessions|shared|sidebar|signal|sister|site|socket|software|solutions|spanish|spec|specialized|src|ssl|stage|standard|standby|static|statistics|status|stealth|storage|streak|stripe|structured|sub|subscription|success|supabase|support|sustainable|sync|synced|system|tailscale|task|tasks|team|tech|telegram|temp|temporary|test|tests|testing|theme|thursday|tim|time|token|tokenization|tool|top|total|trace|tracking|transaction|trello|trust|tuesday|tweet|twitter|twitter|type|typed|ui|unique|unit|united|unsent|update|user|valid|validate|validation|vendor|ver|verify|vercel|vitest|warmth|webhook|website|wednesday|weekly|whatsapp|whimsey|woah|work|workflow|workspace|world|www|x|zero)[_-]/i;
-
-function inferType(name, evidence) {
-  const lname = name.toLowerCase().replace(/ /g, "_");
-
-  // 1. Disqualifying syntax → Entity (IDs, paths, URLs)
-  if (/^[#0-9]/.test(name)) return "Entity";
-  if (/[\/:]/.test(name)) return "Entity";
-  if (/\.(ts|tsx|js|mjs|json|md|py|yaml|yml|html|css|sql|env|toml|sh)$/i.test(name)) return "Entity";
-  if (/\.(com|net|org|io|ai|dev|app|internal|edu|agency)\b/i.test(lname)) return "Entity";
-  if (/^u\//i.test(lname)) return "Entity";
-
-  // 2. Explicit allowlists (highest priority)
-  if (PERSON_NAMES.has(lname)) return "Person";
-  if (TECH_NAMES.has(lname)) return "Technology";
-  if (ORG_NAMES.has(lname)) return "Organization";
-  if (CONCEPT_NAMES.has(lname)) return "Concept";
-  if (LOCATION_NAMES.has(lname)) return "Entity";
-
-  // 3. Suffix patterns (check specific/long ones before short)
-  if (ORG_SUFFIX_RE.test(lname)) return "Organization";
-  if (TECH_PREFIX_RE.test(lname)) return "Technology";
-  if (CONCEPT_SUFFIX_RE.test(lname)) return "Concept";
-  if (CONTENT_SUFFIX_RE.test(lname)) return "Entity";
-  if (TECH_SUFFIX_RE.test(lname)) return "Technology";
-  if (ENTITY_SUFFIX_RE.test(lname)) return "Entity";
-
-  // 4. Contains known brand token → Technology
-  if (CONTAINS_BRAND_RE.test(lname)) return "Technology";
-
-  // 5. Can this entity be a person at all?
-  //    If the name starts with a tech/concept/domain prefix, block Person.
-  const canBePerson = !NOT_PERSON_PREFIX_RE.test(lname);
-
-  // 6. "FirstName LastName" pattern → Person (if not blocked)
-  if (canBePerson && /^[A-Z][a-z]{1,15}[_ ][A-Z][a-z]{1,15}$/.test(name)) {
-    return "Person";
-  }
-
-  // 7. Role-aware vote across ALL triples this entity appears in
-  let personScore = canBePerson ? 0 : -1e9; // blocked = cannot win Person
-  let techScore = 0;
-  let orgScore = 0;
-  let conceptScore = 0;
-
-  for (const { predicate, role } of evidence) {
-    const lpred = predicate.toLowerCase();
-
-    if (role === "subject") {
-      for (const p of PERSON_AS_SUBJECT) { if (lpred.includes(p)) { personScore += 2; break; } }
-    }
-    if (role === "object") {
-      for (const p of PERSON_AS_OBJECT) { if (lpred.includes(p)) { personScore += 2; break; } }
-    }
-    if (role === "object") {
-      for (const p of TECH_AS_OBJECT) { if (lpred.includes(p)) { techScore += 2; break; } }
-    }
-    if (role === "subject") {
-      for (const p of TECH_AS_SUBJECT) { if (lpred.includes(p)) { techScore += 1; break; } }
-    }
-
-    if (lpred.includes("founded") || lpred.includes("cofounded") ||
-        lpred.includes("belongs_to") || lpred.includes("member_of")) {
-      if (role === "object") orgScore += 2;
-      else orgScore += 1;
-    }
-
-    if (lpred.includes("is_type_of") || lpred.includes("is_a")) {
-      conceptScore += 2;
-    }
-  }
-
-  const max = Math.max(personScore, techScore, orgScore, conceptScore);
-  if (max === 0) return "Entity";
-  if (conceptScore === max) return "Concept";
-  if (personScore === max) return "Person";
-  if (orgScore === max) return "Organization";
-  if (techScore === max) return "Technology";
-
-  return "Entity";
-}
 
 // ── Polling Loop ─────────────────────────────────────────────────────────────
 
@@ -596,7 +365,7 @@ async function refreshGraph() {
     Promise.resolve(parseGooseKG()),
   ]);
 
-  const newGraph = buildGraph(msamResult.triples, gooseKG);
+  const newGraph = buildGraph(msamResult.triples, gooseKG, msamResult.entityTypes ?? new Map());
 
   const changed =
     newGraph.meta.filteredEntities !== graphData.meta.filteredEntities ||
