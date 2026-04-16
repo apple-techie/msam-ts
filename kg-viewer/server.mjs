@@ -527,15 +527,17 @@ function inferType(name, evidence) {
   // 4. Contains known brand token → Technology
   if (CONTAINS_BRAND_RE.test(lname)) return "Technology";
 
-  // 5. "FirstName LastName" pattern → Person
-  //    Only fires if the first token isn't a tech/concept prefix.
-  if (!NOT_PERSON_PREFIX_RE.test(lname) &&
-      /^[A-Z][a-z]{1,15}[_ ][A-Z][a-z]{1,15}$/.test(name)) {
+  // 5. Can this entity be a person at all?
+  //    If the name starts with a tech/concept/domain prefix, block Person.
+  const canBePerson = !NOT_PERSON_PREFIX_RE.test(lname);
+
+  // 6. "FirstName LastName" pattern → Person (if not blocked)
+  if (canBePerson && /^[A-Z][a-z]{1,15}[_ ][A-Z][a-z]{1,15}$/.test(name)) {
     return "Person";
   }
 
-  // 6. Role-aware vote across ALL triples this entity appears in
-  let personScore = 0;
+  // 7. Role-aware vote across ALL triples this entity appears in
+  let personScore = canBePerson ? 0 : -1e9; // blocked = cannot win Person
   let techScore = 0;
   let orgScore = 0;
   let conceptScore = 0;
