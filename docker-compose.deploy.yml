@@ -105,7 +105,7 @@ services:
     container_name: msam-kg-viewer
     restart: unless-stopped
     volumes:
-      - /opt/msam-data/kg-viewer:/app:ro
+      - ./kg-viewer:/app:ro
     working_dir: /app
     command:
       - node
