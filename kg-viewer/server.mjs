@@ -136,12 +136,16 @@ async function fetchMsamTriples(agentId) {
           );
           if (!r.ok) return;
           const data = await r.json();
-          for (const hop of Object.values(data.hops || {})) {
-            for (const t of hop) {
-              const key = `${t.subject}|${t.predicate}|${t.object}`;
-              if (!allTriples.has(key)) {
-                allTriples.set(key, t);
-              }
+          // Handle both legacy {hops: {0: [...], 1: [...]}} and current {relations: [...]} shapes
+          const triples = [
+            ...(data.relations || []),
+            ...Object.values(data.hops || {}).flat(),
+          ];
+          for (const t of triples) {
+            if (!t || !t.subject || !t.predicate || !t.object) continue;
+            const key = `${t.subject}|${t.predicate}|${t.object}`;
+            if (!allTriples.has(key)) {
+              allTriples.set(key, t);
             }
           }
         } catch {}
