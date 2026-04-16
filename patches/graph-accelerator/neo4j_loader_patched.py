@@ -385,41 +385,75 @@ def apply_domain_labels_to_all():
     return labeled
 
 
+import re as _re
+
+# Labels reserved by the graph accelerator for its own structural concerns.
+# Everything else is dynamic and can appear/disappear as the ontology evolves.
+_RESERVED_LABELS = {"Entity", "Atom", "Commit", "Package", "File", "TradeOutcome",
+                    "Ops", "Kainotomic", "HYDRA", "Legal", "Social"}
+
+_LABEL_SAFE_RE = _re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,63}$")
+
+
+def _sanitize_label(type_name: str) -> str | None:
+    """Return the type name if it's a safe Cypher label identifier, else None."""
+    if not type_name or type_name == "unknown":
+        return None
+    if not _LABEL_SAFE_RE.match(type_name):
+        return None
+    if type_name in _RESERVED_LABELS:
+        return None
+    return type_name
+
+
 def apply_type_labels_to_all():
-    """Apply entity-type labels (Person, Technology, Organization, ...) to Entity nodes based on their type property."""
+    """Apply dynamic entity-type labels to Entity nodes based on the `type` property.
+
+    The ontology is open — any Title_Case type coming from MSAM is propagated
+    as a Neo4j label. Reserved structural labels (Entity, Atom, etc.) and
+    domain labels (Ops, Legal, ...) are left untouched. Stale type labels are
+    removed when an entity's type changes between runs.
+    """
     labeled = 0
     with Neo4jClient.session() as session:
-        result = session.run("""
+        # Discover the full universe of labels currently in use so we know
+        # which ones to scrub before re-applying a fresh one per entity.
+        universe_result = session.run("CALL db.labels() YIELD label RETURN label")
+        all_labels = {r["label"] for r in universe_result}
+        dynamic_labels = {l for l in all_labels if _sanitize_label(l)}
+
+        records = list(session.run("""
             MATCH (e:Entity)
             WHERE e.type IS NOT NULL AND e.type <> 'unknown'
             RETURN e.name as name, e.type as type
-        """)
-        records = list(result)
+        """))
 
     if not records:
         logger.info("No entities with types to label")
         return 0
 
-    valid_types = {"Person", "Organization", "Technology", "Concept", "Location", "Entity"}
     with Neo4jClient.session() as session:
         for rec in records:
             type_name = rec["type"]
-            if type_name not in valid_types:
+            safe = _sanitize_label(type_name)
+            if not safe:
                 continue
-            # Remove any previous type label, then apply the current one. This keeps the
-            # node idempotent under type changes (a node's type can migrate if the
-            # majority vote shifts between ETL runs).
-            cypher_remove = """
-                MATCH (e:Entity {name: $name})
-                REMOVE e:Person, e:Organization, e:Technology, e:Concept, e:Location
-            """
-            session.run(cypher_remove, {"name": rec["name"]})
-            if type_name != "Entity":
-                cypher_set = f"""
-                    MATCH (e:Entity {{name: $name}})
-                    SET e:{type_name}
-                """
-                session.run(cypher_set, {"name": rec["name"]})
+
+            # 1. Remove any previous dynamic type labels from this node (idempotent
+            #    under type migration). We only touch labels in `dynamic_labels`,
+            #    never the reserved structural/domain set.
+            if dynamic_labels:
+                remove_parts = ", ".join(f"e:{l}" for l in dynamic_labels)
+                session.run(
+                    f"MATCH (e:Entity {{name: $name}}) REMOVE {remove_parts}",
+                    {"name": rec["name"]},
+                )
+
+            # 2. Apply the current type label.
+            session.run(
+                f"MATCH (e:Entity {{name: $name}}) SET e:{safe}",
+                {"name": rec["name"]},
+            )
             labeled += 1
 
     logger.info(f"Applied type labels to {labeled} entities")

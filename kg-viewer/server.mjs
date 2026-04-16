@@ -531,20 +531,8 @@ const HTML = `<!DOCTYPE html>
   }
   .filter-btn .dot { width: 5px; height: 5px; border-radius: 50%; }
   .filter-btn.inactive { opacity: 0.3; filter: grayscale(0.8); }
-  .filter-btn[data-type="Person"] { color: var(--person); border-color: rgba(245,158,11,0.3); background: rgba(245,158,11,0.08); }
-  .filter-btn[data-type="Person"] .dot { background: var(--person); }
-  .filter-btn[data-type="Organization"] { color: var(--org); border-color: rgba(139,92,246,0.3); background: rgba(139,92,246,0.08); }
-  .filter-btn[data-type="Organization"] .dot { background: var(--org); }
-  .filter-btn[data-type="Project"] { color: var(--project); border-color: rgba(6,182,212,0.3); background: rgba(6,182,212,0.08); }
-  .filter-btn[data-type="Project"] .dot { background: var(--project); }
-  .filter-btn[data-type="Technology"] { color: var(--tech); border-color: rgba(16,185,129,0.3); background: rgba(16,185,129,0.08); }
-  .filter-btn[data-type="Technology"] .dot { background: var(--tech); }
-  .filter-btn[data-type="Concept"] { color: var(--concept); border-color: rgba(236,72,153,0.3); background: rgba(236,72,153,0.08); }
-  .filter-btn[data-type="Concept"] .dot { background: var(--concept); }
-  .filter-btn[data-type="Entity"] { color: var(--entity); border-color: rgba(148,163,184,0.3); background: rgba(148,163,184,0.08); }
-  .filter-btn[data-type="Entity"] .dot { background: var(--entity); }
-  .filter-btn[data-type="Configuration"] { color: var(--config); border-color: rgba(249,115,22,0.3); background: rgba(249,115,22,0.08); }
-  .filter-btn[data-type="Configuration"] .dot { background: var(--config); }
+  /* Colors are applied inline via typeColor(type) — the ontology is dynamic. */
+  .filter-btn .count { font-size: 9px; opacity: 0.6; font-weight: 400; }
 
   #detail-section { flex: 1; overflow-y: auto; padding: 14px 16px;
     scrollbar-width: thin; scrollbar-color: #1e1e2e transparent; }
@@ -685,17 +673,33 @@ const HTML = `<!DOCTYPE html>
 <div id="toast"></div>
 
 <script>
-const TYPE_COLORS = {
-  Person: '#f59e0b', Organization: '#8b5cf6', Project: '#06b6d4',
-  Technology: '#10b981', Configuration: '#f97316', Concept: '#ec4899', Entity: '#94a3b8'
-};
+// ── Dynamic ontology colors ─────────────────────────────────────────
+// The ontology is defined by the data, not the code. Every type the LLM
+// produces is rendered with a deterministic hash-based color so the same
+// type always gets the same hue across reloads, and new types get a color
+// automatically without any code change.
+
+function typeHash(s) {
+  let h = 5381;
+  for (let i = 0; i < s.length; i++) h = ((h << 5) + h) ^ s.charCodeAt(i);
+  return h >>> 0;
+}
+function typeHue(type) {
+  if (!type) return 220;
+  // Golden-angle multiplier spreads consecutive hashes around the color wheel.
+  return (typeHash(String(type)) * 137) % 360;
+}
+function typeColor(type)       { return type ? 'hsl('  + typeHue(type) + ', 62%, 60%)'      : '#94a3b8'; }
+function typeBgColor(type)     { return type ? 'hsla(' + typeHue(type) + ', 62%, 60%, 0.10)' : 'rgba(148,163,184,0.08)'; }
+function typeBorderColor(type) { return type ? 'hsla(' + typeHue(type) + ', 62%, 60%, 0.35)' : 'rgba(148,163,184,0.3)'; }
 
 let rawEntities = [], rawRelations = [], rawMeta = {};
 let nodes = [], links = [];
 let simulation, svg, root, linkSel, nodeSel, edgeLabelSel, zoom;
 let selectedNodeId = null;
 let searchQuery = '';
-let activeFilters = new Set(Object.keys(TYPE_COLORS));
+let activeFilters = new Set();   // populated from data; starts empty until first render
+let seenTypes = new Set();       // every type we've ever rendered, used to decide whether a type is "new"
 let width, height;
 let initialized = false;
 
@@ -735,9 +739,8 @@ function updateGraph(entities, relations, meta) {
   document.getElementById('last-updated').textContent =
     'updated ' + new Date().toLocaleTimeString();
 
-  // Discover types dynamically
-  const types = new Set(entities.map(e => e.entityType));
-  types.forEach(t => activeFilters.add(t));
+  // Rebuild filter chips from the current data — the ontology is dynamic.
+  setupFilters();
 
   if (!initialized) { buildAndRender(); initialized = true; }
   else { rebuildGraph(addedIds); }
@@ -806,7 +809,7 @@ function rebuildGraph(addedIds) {
 }
 
 function getRadius(n) { return 5 + Math.sqrt((n.connections||0)+1)*2.5; }
-function nodeColor(type) { return TYPE_COLORS[type]||'#94a3b8'; }
+function nodeColor(type) { return typeColor(type); }
 
 function renderGraph(newIds) {
   if(!svg) return;
@@ -955,21 +958,52 @@ function updateSearchHighlight(){
 }
 
 function setupFilters(){
-  const wrap=document.getElementById('filter-buttons');
-  Object.keys(TYPE_COLORS).forEach(type=>{
-    const btn=document.createElement('button');
-    btn.className='filter-btn';btn.dataset.type=type;
-    btn.innerHTML='<span class="dot"></span>'+type;
-    btn.addEventListener('click',()=>{
-      if(activeFilters.has(type)){activeFilters.delete(type);btn.classList.add('inactive');}
-      else{activeFilters.add(type);btn.classList.remove('inactive');}
-      selectedNodeId=null;
-      document.getElementById('empty-state').style.display='';
+  // Rebuild every render — the ontology is dynamic, types come and go with the data.
+  const wrap = document.getElementById('filter-buttons');
+  wrap.innerHTML = '';
+
+  // Count types across the current entity set.
+  const counts = new Map();
+  for (const e of rawEntities) {
+    const t = e.entityType || 'Unknown';
+    counts.set(t, (counts.get(t) || 0) + 1);
+  }
+  if (counts.size === 0) return;
+
+  // Sort by count desc, then name. Show everything — they're color-coded and wrap naturally.
+  const sorted = [...counts.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
+
+  // Preserve user toggles across re-renders. On first render activeFilters is empty,
+  // so all types get activated. On later renders, only types we've never seen before
+  // get auto-activated (so new data isn't silently hidden, but toggles stick).
+  for (const [t] of sorted) {
+    if (!seenTypes.has(t)) {
+      activeFilters.add(t);
+      seenTypes.add(t);
+    }
+  }
+
+  for (const [type, count] of sorted) {
+    const btn = document.createElement('button');
+    btn.className = 'filter-btn';
+    btn.dataset.type = type;
+    btn.style.color = typeColor(type);
+    btn.style.borderColor = typeBorderColor(type);
+    btn.style.backgroundColor = typeBgColor(type);
+    btn.innerHTML =
+      '<span class="dot" style="background:' + typeColor(type) + '"></span>' +
+      type + ' <span class="count">' + count + '</span>';
+    if (!activeFilters.has(type)) btn.classList.add('inactive');
+    btn.addEventListener('click', () => {
+      if (activeFilters.has(type)) { activeFilters.delete(type); btn.classList.add('inactive'); }
+      else { activeFilters.add(type); btn.classList.remove('inactive'); }
+      selectedNodeId = null;
+      document.getElementById('empty-state').style.display = '';
       document.getElementById('node-detail').classList.remove('visible');
-      renderGraph([]);runSimulation();updateSidebarCounts();
+      renderGraph([]); runSimulation(); updateSidebarCounts();
     });
     wrap.appendChild(btn);
-  });
+  }
 }
 
 function populateSidebar(d){
@@ -978,8 +1012,15 @@ function populateSidebar(d){
   detail.classList.add('visible');
   const srcBadge=d.source==='goose'?'<span class="source-badge goose">Goose KG</span>'
     :'<span class="source-badge msam">MSAM</span>';
-  document.getElementById('detail-badge-wrap').innerHTML=
-    '<div class="detail-badge" data-type="'+d.entityType+'"><span class="dot"></span>'+d.entityType+'</div>'+srcBadge;
+  {
+    const badgeColor = typeColor(d.entityType);
+    const badgeBg = typeBgColor(d.entityType);
+    const badgeBorder = typeBorderColor(d.entityType);
+    document.getElementById('detail-badge-wrap').innerHTML=
+      '<div class="detail-badge" style="color:'+badgeColor+';background:'+badgeBg+';border:1px solid '+badgeBorder+'">' +
+        '<span class="dot" style="background:'+badgeColor+'"></span>'+d.entityType+
+      '</div>'+srcBadge;
+  }
   document.getElementById('detail-name').textContent=d.name||d.id;
   const obsList=document.getElementById('detail-observations');
   obsList.innerHTML='';

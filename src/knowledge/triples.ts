@@ -49,21 +49,39 @@ export function classifyQuery(query: string): { type: string; tripleRatio: numbe
 
 // ─── Extraction Prompt ───────────────────────────────────────────
 
-const EXTRACTION_PROMPT = `Extract factual triples from this memory atom. Classify each entity with a type.
+const EXTRACTION_PROMPT = `Extract factual triples from this memory atom. Classify each entity with the most SPECIFIC type that fits.
 
 ENTITY RULES:
-- Subject/Object must be a NAMED ENTITY (person, organization, tool, system, place, project), max 30 chars
+- Subject/Object must be a NAMED ENTITY, max 30 chars
 - Normalize entities: Title_Case with underscores (Andrew_Peltekci, not drew/Drew/DREW)
 - NEVER use "true", "false", "yes", "no", numbers alone, or generic words as objects
 - If about the user's preferences, subject = "User"
 
-ENTITY TYPES — classify each entity as one of:
-  Person        — a specific human (Andrew_Peltekci, Garry_Tan, Sam_Lambert)
-  Organization  — a company, VC firm, LLC, agency (Kainotomic, Comma_Capital, Peltekci_Agency_Inc)
-  Technology    — a tool, platform, SaaS, software, hardware, bot (Vercel, Stripe, Claude, Mac_Studio)
-  Concept       — an abstract noun, role, category, theme (Founder, Investor, Marketing, SEO, Pricing)
-  Location      — a physical place (Los_Angeles, Moreno_Valley)
-  Entity        — fallback for anything else (IDs, file paths, tasks, events)
+TYPE RULES — pick whatever is most specific and natural. Use singular, Title_Case.
+Reuse types you've seen before when they fit. Invent new types when reality demands it.
+
+Examples of good types (non-exhaustive, use anything that fits):
+  Person, Founder, Investor, Engineer, Partner, Advisor
+  Organization, Startup, VC_Firm, LLC, Agency, Bank, Cafe
+  Agent, Bot, AI_Agent, Orchestrator, Worker
+  SaaS, Library, Framework, Database, API, Endpoint
+  Codebase, Repository, Fork, Package
+  Gateway, Server, Node, Container, Cluster
+  Infrastructure, Hardware, Cloud, Device
+  Dashboard, Widget, UI_Component, Page, Screen
+  Automation, Workflow, Cron_Job, Pipeline, Script
+  Document, Note, Email, Message, Thread, Post, Reel, Story, Campaign
+  Meeting, Call, Event, Deadline, Milestone
+  Role, Skill, Concept, Category, Theme, Principle
+  Location, City, Office, Venue
+  Project, Initiative, Slug, Milestone
+  Task, Issue, Bug, Feature_Request, PR
+  Commodity, Product, Jewelry, Currency
+  Dataset, Schema, Table, Field, Property, Config
+  Account, Credential, Secret, Keychain_Item
+
+Prefer SPECIFIC over generic. Stripe is a SaaS, not "Technology". Vercel is a Platform, not "Technology".
+Andrew_Peltekci is a Founder (or Person), not just "Person". An investor is an Investor, not a "Concept".
 
 PREDICATE RULES - USE ONLY THESE PREDICATES:
   Identity: is_founder_of, is_member_of, has_role, is_instance_of, is_type_of
@@ -88,10 +106,12 @@ Output format (one per line, or SKIP):
 (subject [Type], predicate, object [Type])
 
 Examples:
-(Andrew_Peltekci [Person], is_founder_of, Kainotomic [Organization])
-(Enduru [Technology], deployed_on, Mac_Studio [Technology])
-(User [Person], prefers, Dark_Mode [Concept])
-(Andrew_Peltekci [Person], scheduled_for, Outlander_VC_1:1_Intro_Call [Entity])`;
+(Andrew_Peltekci [Founder], is_founder_of, Kainotomic [Startup])
+(Enduru_Gateway [Gateway], deployed_on, Mac_Studio [Hardware])
+(Stripe [SaaS], integrates_with, Enduru_AI [Startup])
+(Aurora [AI_Agent], manages, FB_Marketplace_Scan [Automation])
+(Ryan_Hoover [Founder], founded, Product_Hunt [Startup])
+(User [Person], prefers, Dark_Mode [UI_Preference])`;
 
 // ─── Triple ID ───────────────────────────────────────────────────
 
@@ -151,14 +171,77 @@ function getLlmConfig(): { url: string; model: string; apiKey: string } | null {
 
 // ─── Parse LLM Output ───────────────────────────────────────────
 
-const VALID_TYPES = new Set(["Person", "Organization", "Technology", "Concept", "Location", "Entity"]);
+/**
+ * Normalize a raw type annotation from the LLM.
+ *
+ * Dynamic ontology: we accept any Title_Case identifier. Per-word
+ * title-casing handles multi-word types ("VC_Firm", "AI_Agent") while
+ * still catching lowercase/uppercase drift ("saas" -> "SaaS" is handled
+ * via the ALIASES map below, "person" -> "Person" by default rule).
+ *
+ * Returns null for empty / non-identifier-shaped values.
+ */
+const TYPE_ALIASES: Record<string, string> = {
+  // Canonical variants for things the LLM tends to wobble on
+  "tools": "Tool",
+  "technologies": "Technology",
+  "orgs": "Organization",
+  "organizations": "Organization",
+  "people": "Person",
+  "persons": "Person",
+  "humans": "Person",
+  "agents": "Agent",
+  "bots": "Bot",
+  "ai": "AI_Agent",
+  "saas": "SaaS",
+  "api": "API",
+  "sdk": "SDK",
+  "cli": "CLI",
+  "ui": "UI_Component",
+  "ux": "UX_Concept",
+  "vc": "VC_Firm",
+  "llc": "LLC",
+  "inc": "Organization",
+  "kb": "Knowledge_Base",
+  "pr": "Pull_Request",
+  "prs": "Pull_Request",
+  "crons": "Cron_Job",
+  "crontab": "Cron_Job",
+  "workflows": "Workflow",
+  "automations": "Automation",
+  "pipelines": "Pipeline",
+  "codebases": "Codebase",
+  "repos": "Repository",
+  "repository": "Repository",
+};
 
 function normalizeType(raw: string | undefined): string | null {
   if (!raw) return null;
-  const cleaned = raw.trim().replace(/^\[|\]$/g, "").trim();
-  // Title-case: first letter uppercase, rest lowercase
-  const title = cleaned.charAt(0).toUpperCase() + cleaned.slice(1).toLowerCase();
-  return VALID_TYPES.has(title) ? title : null;
+  let cleaned = raw.trim().replace(/^\[|\]$/g, "").trim();
+  if (!cleaned) return null;
+
+  // Strip non-identifier chars (keep letters, digits, underscore, hyphen)
+  cleaned = cleaned.replace(/[^\w-]/g, "_").replace(/_+/g, "_").replace(/^_|_$/g, "");
+  if (!cleaned || cleaned.length > 40) return null;
+
+  // Alias lookup (case-insensitive, on the cleaned form)
+  const aliasKey = cleaned.toLowerCase();
+  if (TYPE_ALIASES[aliasKey]) return TYPE_ALIASES[aliasKey];
+
+  // Title-case each underscore-separated word (preserve known all-caps like API, SaaS, UI)
+  // If a word is already mixed-case, leave it; else upper-first + lower-rest.
+  const parts = cleaned.split(/[_\-]/);
+  const titled = parts
+    .filter((p) => p.length > 0)
+    .map((p) => {
+      // Mixed case? (has at least one upper and one lower, like "SaaS") — leave alone.
+      if (/[a-z]/.test(p) && /[A-Z]/.test(p)) return p;
+      // All same case — Title-case it.
+      return p.charAt(0).toUpperCase() + p.slice(1).toLowerCase();
+    })
+    .join("_");
+
+  return titled.length >= 2 ? titled : null;
 }
 
 type ParsedTriple = {
