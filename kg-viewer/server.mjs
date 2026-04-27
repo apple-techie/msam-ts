@@ -788,13 +788,14 @@ function rebuildGraph(addedIds) {
 }
 
 // Dramatic degree-based sizing: leaves stay tiny dots, hubs dominate.
-// Max radius capped at 42 so the largest hub never blows out the viewport.
-// Curve: linear-ish through low degrees then sqrt for hubs, mapping degree
-// 1..2300+ to ~2.5..42 px.
+// Range ~2..50 px. Pow(0.55) curve gives mid-tier hubs (degree 30-200)
+// significantly bigger than leaves so all THREE tiers are visually
+// distinct: leaves (1-3 conn ≈ 2-4 px), secondary hubs (50-200 ≈ 12-22 px),
+// mega-hubs (1000+ ≈ 35-50 px).
 function getRadius(n) {
   const c = n.connections || 0;
-  if (c === 0) return 2.5;
-  return Math.min(42, 2.5 + Math.sqrt(c) * 0.85);
+  if (c === 0) return 2;
+  return Math.min(50, 2 + Math.pow(c, 0.55) * 1.4);
 }
 function nodeColor(type) { return typeColor(type); }
 
@@ -831,15 +832,23 @@ function renderGraph(newIds) {
     .on('mousemove',moveTip)
     .on('mouseleave',()=>{hideTip();resetHighlight();});
 
+  // Soft glow scales with node — bigger hubs cast bigger glows, drawing the eye.
   nodeSel.append('circle').attr('class','node-glow')
-    .attr('r',d=>getRadius(d)+4).attr('fill',d=>nodeColor(d.entityType)).attr('opacity',0.06);
+    .attr('r',d=>getRadius(d)*1.6+4).attr('fill',d=>nodeColor(d.entityType))
+    .attr('opacity',d=>Math.min(0.22, 0.05 + getRadius(d)*0.005));
+  // Solid filled circle (fully opaque) so volume reads instantly. Was 13%
+  // alpha fill which made nodes look like rings — couldn't tell sizes apart.
   nodeSel.append('circle').attr('class','node-circle')
     .attr('r',d=>getRadius(d))
-    .attr('fill',d=>nodeColor(d.entityType)+'22')
-    .attr('stroke',d=>nodeColor(d.entityType));
-  nodeSel.append('text').attr('class','node-type')
+    .attr('fill',d=>nodeColor(d.entityType))
+    .attr('stroke',d=>nodeColor(d.entityType))
+    .attr('stroke-width',d=>getRadius(d)>15?2:1);
+  // Only label hubs in dense views — leaf labels at this scale just produce noise.
+  // Threshold: radius >= 8 (~degree 20+) when total nodes > 500.
+  const labelThreshold = vn.length > 500 ? 8 : 0;
+  nodeSel.filter(d=>getRadius(d) >= labelThreshold).append('text').attr('class','node-type')
     .attr('dy',d=>-(getRadius(d)+11)).text(d=>d.entityType);
-  nodeSel.append('text').attr('class','node-label')
+  nodeSel.filter(d=>getRadius(d) >= labelThreshold).append('text').attr('class','node-label')
     .attr('dy',d=>getRadius(d)+13)
     .text(d=>d.id.length>20?d.id.slice(0,18)+'\\u2026':d.id);
 
