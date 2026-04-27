@@ -407,11 +407,11 @@ const HTML = `<!DOCTYPE html>
   #graph-svg { width: 100%; height: 100%; cursor: grab; }
   #graph-svg:active { cursor: grabbing; }
 
-  .link { stroke: rgba(255,255,255,0.08); stroke-width: 1px; fill: none; transition: stroke 0.2s, stroke-width 0.2s; }
-  .link.highlighted { stroke: rgba(255,255,255,0.4); stroke-width: 1.5px; }
-  .link.dimmed { stroke: rgba(255,255,255,0.02); }
-  .link.msam { stroke: rgba(6,182,212,0.12); }
-  .link.goose { stroke: rgba(139,92,246,0.15); }
+  .link { stroke: rgba(34,211,238,0.18); stroke-width: 0.8px; fill: none; transition: stroke 0.2s, stroke-width 0.2s; }
+  .link.highlighted { stroke: rgba(255,255,255,0.55); stroke-width: 1.6px; }
+  .link.dimmed { stroke: rgba(34,211,238,0.04); }
+  .link.msam { stroke: rgba(34,211,238,0.22); }
+  .link.goose { stroke: rgba(139,92,246,0.22); }
 
   .node-group { cursor: pointer; }
   .node-glow { pointer-events: none; }
@@ -787,7 +787,15 @@ function rebuildGraph(addedIds) {
   } else { runSimulation(); }
 }
 
-function getRadius(n) { return 5 + Math.sqrt((n.connections||0)+1)*2.5; }
+// Dramatic degree-based sizing: leaves stay tiny dots, hubs dominate.
+// Max radius capped at 42 so the largest hub never blows out the viewport.
+// Curve: linear-ish through low degrees then sqrt for hubs, mapping degree
+// 1..2300+ to ~2.5..42 px.
+function getRadius(n) {
+  const c = n.connections || 0;
+  if (c === 0) return 2.5;
+  return Math.min(42, 2.5 + Math.sqrt(c) * 0.85);
+}
 function nodeColor(type) { return typeColor(type); }
 
 function renderGraph(newIds) {
@@ -855,7 +863,9 @@ function runSimulation() {
         const tr=getRadius(typeof d.target==='object'?d.target:{connections:1});
         return 50+sr+tr;
       }).strength(0.25))
-    .force('charge',d3.forceManyBody().strength(d=>-120-getRadius(d)*6))
+    // Hubs repel HARDER so they spread out as anchors; leaves are nearly weightless.
+    // The (radius)^1.6 term gives big nodes outsized push without crushing leaves.
+    .force('charge',d3.forceManyBody().strength(d=>-60-Math.pow(getRadius(d),1.6)*6))
     .force('center',d3.forceCenter(width/2,height/2))
     .force('collision',d3.forceCollide().radius(d=>getRadius(d)+12).strength(0.8))
     .force('x',d3.forceX(width/2).strength(0.03))
