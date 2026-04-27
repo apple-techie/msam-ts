@@ -856,21 +856,34 @@ function runSimulation() {
     return vi.has(s)&&vi.has(t);
   });
   if(simulation) simulation.stop();
+  // Scale forces by visible node count so 3000+ nodes still spread to fill
+  // the viewport. With small N the original strengths were fine; with thousands
+  // of nodes the previous parameters collapsed everything into a dense ball.
+  const N = vn.length;
+  const isLarge = N > 500;
+
   simulation = d3.forceSimulation(vn)
     .force('link',d3.forceLink(vl).id(d=>d.id)
       .distance(d=>{
         const sr=getRadius(typeof d.source==='object'?d.source:{connections:1});
         const tr=getRadius(typeof d.target==='object'?d.target:{connections:1});
-        return 50+sr+tr;
-      }).strength(0.25))
+        // Longer links at higher density so spokes radiate further from hubs.
+        return (isLarge ? 90 : 50) + sr + tr;
+      }).strength(isLarge ? 0.4 : 0.25))
     // Hubs repel HARDER so they spread out as anchors; leaves are nearly weightless.
-    // The (radius)^1.6 term gives big nodes outsized push without crushing leaves.
-    .force('charge',d3.forceManyBody().strength(d=>-60-Math.pow(getRadius(d),1.6)*6))
-    .force('center',d3.forceCenter(width/2,height/2))
-    .force('collision',d3.forceCollide().radius(d=>getRadius(d)+12).strength(0.8))
-    .force('x',d3.forceX(width/2).strength(0.03))
-    .force('y',d3.forceY(height/2).strength(0.03))
-    .alphaDecay(0.02)
+    // Strong base repulsion is essential at high N to prevent the black-hole effect.
+    .force('charge',d3.forceManyBody()
+      .strength(d => (isLarge ? -260 : -60) - Math.pow(getRadius(d), 1.7) * 9)
+      .distanceMin(2)
+      .distanceMax(800))
+    .force('center',d3.forceCenter(width/2,height/2).strength(isLarge ? 0.04 : 0.1))
+    .force('collision',d3.forceCollide().radius(d=>getRadius(d) + (isLarge ? 4 : 12)).strength(0.85))
+    // Drop the x/y gravity at scale — it was pulling everything inward.
+    .force('x',d3.forceX(width/2).strength(isLarge ? 0.005 : 0.03))
+    .force('y',d3.forceY(height/2).strength(isLarge ? 0.005 : 0.03))
+    // Slower decay so the layout has time to fully spread before settling.
+    .alphaDecay(isLarge ? 0.012 : 0.02)
+    .velocityDecay(isLarge ? 0.35 : 0.4)
     .on('tick',ticked);
 }
 
