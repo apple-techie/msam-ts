@@ -36,13 +36,24 @@ const clients = new Set();
 
 // ── MSAM Data Fetch ──────────────────────────────────────────────────────────
 
-// Title-case a label for display, e.g. "concept" -> "Concept".
-// Mem0's bounded export emits lowercase ("person", "concept", ...); MSAM legacy
-// emits TitleCase. We normalize to TitleCase for consistent UI buckets.
+// Bounded entity vocabulary — Mem0 enduru/turkules/hermes stacks emit only
+// these (15 types + the special internal `__User__`). Aurora/Sam are unbounded
+// by design (we deliberately didn't apply MEM0_BOUND_PROMPT to them); their
+// free-form types — Process, Action, File, Unknown, Date, Object, Feature,
+// System, Activity, Category, Path, Command, Component, Data, Quantity, Time,
+// Configuration, Technology, Api, Identifier, etc. — collapse to "Other"
+// here so the All Agents type filter stays at the bounded-16 set.
+const BOUNDED_TYPES = new Set([
+  "Person", "Organization", "Project", "Tool", "Service",
+  "Document", "Task", "Concept", "Event", "Location",
+  "Status", "Code", "Endpoint", "Issue", "Other", "User",
+]);
+
 function titleCase(s) {
   if (!s) return s;
   if (s === "__User__") return "User";
-  return s.charAt(0).toUpperCase() + s.slice(1);
+  const tc = s.charAt(0).toUpperCase() + s.slice(1);
+  return BOUNDED_TYPES.has(tc) ? tc : "Other";
 }
 
 async function fetchMsamTriples(agentId) {
@@ -63,10 +74,14 @@ async function fetchMsamTriples(agentId) {
     : Object.entries(agentData.agent_triples);
 
   const allTriples = new Map();
+  // Track which Mem0 stacks each entity appears in (cross-stack annotation
+  // from mem0-graph-resolver). Empty for triples produced by the older
+  // exporter — falls back gracefully.
+  const seenIn = new Map();
+
   for (const [, agentTriples] of sources) {
     for (const raw of agentTriples) {
       if (!raw || !raw.subject || !raw.predicate || !raw.object) continue;
-      // Normalize snake_case (Mem0 export) and camelCase (legacy) into one shape.
       const subjectType = titleCase(raw.subject_type || raw.subjectType);
       const objectType = titleCase(raw.object_type || raw.objectType);
       const t = {
@@ -80,8 +95,6 @@ async function fetchMsamTriples(agentId) {
       const key = `${t.subject}|${t.predicate}|${t.object}`;
       if (!allTriples.has(key)) allTriples.set(key, t);
 
-      // Vote-merge entity types so the same name with different types (e.g. cross-agent)
-      // tallies correctly.
       const tally = (name, type) => {
         if (!name || !type) return;
         const existing = entityTypes.get(name);
@@ -91,12 +104,25 @@ async function fetchMsamTriples(agentId) {
       };
       tally(t.subject, subjectType);
       tally(t.object, objectType);
+
+      // Resolver-emitted `subject_in` / `object_in` arrays list the Mem0
+      // stacks where that entity appears. We unify them per-entity so a
+      // node clicked in one view can surface its cross-stack memberships.
+      const merge = (name, list) => {
+        if (!name || !list || !Array.isArray(list)) return;
+        const cur = seenIn.get(name) || new Set();
+        for (const a of list) cur.add(a);
+        seenIn.set(name, cur);
+      };
+      merge(t.subject, raw.subject_in);
+      merge(t.object, raw.object_in);
     }
   }
 
   return {
     triples: [...allTriples.values()],
     entityTypes,
+    seenIn,
     stats: { agents: agentData.agents || [] },
   };
 }
@@ -131,11 +157,11 @@ function resolveEntityType(name, triples, entityTypesMap) {
   return "Entity";
 }
 
-function buildGraph(msamTriples, entityTypesMap) {
-  const entityMap = new Map(); // name -> { entityType, observations, source }
+function buildGraph(msamTriples, entityTypesMap, seenInMap) {
+  const entityMap = new Map();
   const relations = [];
+  const seen = seenInMap || new Map();
 
-  // 1. Filter MSAM triples by SKIP predicates/entities and confidence floor.
   const filteredTriples = msamTriples.filter(
     (t) =>
       !SKIP_PREDICATES.has(t.predicate) &&
@@ -144,14 +170,19 @@ function buildGraph(msamTriples, entityTypesMap) {
       (t.confidence || 0) >= 0.3,
   );
 
-  // 2. Build entities + relations using types from MSAM (source of truth).
+  const seenInOf = (name) => {
+    const s = seen.get(name);
+    return s ? [...s].sort() : [];
+  };
+
   for (const t of filteredTriples) {
     if (!entityMap.has(t.subject)) {
       entityMap.set(t.subject, {
         name: t.subject,
         entityType: resolveEntityType(t.subject, filteredTriples, entityTypesMap),
         observations: [],
-        source: "msam",
+        seenIn: seenInOf(t.subject),
+        source: "mem0",
       });
     }
 
@@ -161,7 +192,8 @@ function buildGraph(msamTriples, entityTypesMap) {
           name: t.object,
           entityType: resolveEntityType(t.object, filteredTriples, entityTypesMap),
           observations: [],
-          source: "msam",
+          seenIn: seenInOf(t.object),
+          source: "mem0",
         });
       }
 
@@ -170,7 +202,7 @@ function buildGraph(msamTriples, entityTypesMap) {
         to: t.object,
         relationType: t.predicate.replace(/_/g, " "),
         confidence: t.confidence,
-        source: "msam",
+        source: "mem0",
       });
     } else {
       const ent = entityMap.get(t.subject);
@@ -183,10 +215,6 @@ function buildGraph(msamTriples, entityTypesMap) {
     }
   }
 
-  // 3. Drop orphan entities — those with no visible edges AND no observations.
-  //    These are nodes that made it into the map (usually as a subject whose
-  //    only triples were filtered out) but contribute no information. With
-  //    an observation they still have content worth showing on hover/click.
   const connected = new Set();
   for (const rel of relations) { connected.add(rel.from); connected.add(rel.to); }
   for (const [name, ent] of entityMap) {
@@ -195,13 +223,20 @@ function buildGraph(msamTriples, entityTypesMap) {
     }
   }
 
+  // Cross-stack roll-up: how many entities are referenced by 2+ Mem0 stacks.
+  let crossStack = 0;
+  for (const ent of entityMap.values()) {
+    if (ent.seenIn.length >= 2) crossStack += 1;
+  }
+
   return {
     entities: [...entityMap.values()],
     relations,
     meta: {
-      msamTriples: msamTriples.length,
+      mem0Triples: msamTriples.length,
       filteredEntities: entityMap.size,
       filteredRelations: relations.length,
+      crossStackEntities: crossStack,
       updatedAt: new Date().toISOString(),
     },
   };
@@ -215,20 +250,20 @@ function looksLikeEntity(value, predicate) {
   if (/^\d{4}-\d{2}/.test(value)) return false; // date
   if (/^(true|false|null|none|yes|no|n\/a)$/i.test(value)) return false;
 
-  // Predicates that typically have entity objects
+  // Predicates from the bounded Mem0 vocab that always relate entities to
+  // entities (not entity-to-literal observations). Treat anything related
+  // by these as a node, even if the value is a kebab-case hostname.
   const entityPredicates = [
-    "is_founder_of", "is_cofounder_of", "co_founder_of", "works_with",
-    "is_business_partner_at", "is_strategic_partner_of", "consulting_client",
-    "invested_in", "backed", "uses", "prefers", "belongs_to",
-    "is_technical_cofounder_partner_to", "replied_about", "has_contacted",
-    "connection_request_status", "running_on", "is_type_of", "target_audience",
-    "is_a", "recipient_of", "follows",
+    "runs_on", "located_in", "member_of", "uses", "owns",
+    "created", "depends_on", "assigned_to", "discussed_with",
+    "blocked_by", "replaces", "scheduled_for", "is_founder_of",
+    "is_cofounder_of", "works_with", "invested_in", "is_a",
   ];
-  if (entityPredicates.some((p) => predicate.includes(p))) return true;
+  if (entityPredicates.some((p) => predicate === p || predicate.includes(p))) return true;
 
-  // If it starts with uppercase or has underscores (like a name), it's probably an entity
+  // Looks like an identifier (hostname, container name, repo slug, person name)
   if (/^[A-Z]/.test(value) && value.length < 40) return true;
-  if (value.includes("_") && value.length < 40) return true;
+  if (/[_-]/.test(value) && value.length < 50) return true;
 
   return false;
 }
@@ -245,7 +280,7 @@ function looksLikeEntity(value, predicate) {
 
 async function refreshGraph() {
   const msamResult = await fetchMsamTriples();
-  const newGraph = buildGraph(msamResult.triples, msamResult.entityTypes ?? new Map());
+  const newGraph = buildGraph(msamResult.triples, msamResult.entityTypes ?? new Map(), msamResult.seenIn ?? new Map());
 
   const changed =
     newGraph.meta.filteredEntities !== graphData.meta.filteredEntities ||
@@ -462,7 +497,14 @@ const HTML = `<!DOCTYPE html>
   }
   .source-badge.msam { color: #22d3ee; background: rgba(6,182,212,0.12); border: 1px solid rgba(6,182,212,0.25); }
 
-  .detail-name { font-size: 15px; font-weight: 700; line-height: 1.3; margin-bottom: 14px; word-break: break-word; }
+  .detail-name { font-size: 15px; font-weight: 700; line-height: 1.3; margin-bottom: 6px; word-break: break-word; }
+  .detail-seen-in { font-size: 10px; color: var(--text-muted); margin-bottom: 12px; font-family: 'JetBrains Mono', monospace; display: flex; flex-wrap: wrap; gap: 4px; }
+  .detail-seen-in:empty { display: none; }
+  .detail-seen-in .stack-pill {
+    background: rgba(34,211,238,0.08); border: 1px solid rgba(34,211,238,0.2);
+    border-radius: 10px; padding: 1px 7px; font-size: 9px; color: #67e8f9;
+  }
+  .detail-seen-in .seen-label { color: var(--text-dim); margin-right: 4px; align-self: center; }
   .detail-section-label {
     font-size: 9px; text-transform: uppercase; letter-spacing: 0.1em;
     color: var(--text-dim); font-weight: 600; margin-bottom: 7px; margin-top: 14px;
@@ -574,6 +616,7 @@ const HTML = `<!DOCTYPE html>
     <div id="node-detail">
       <div id="detail-badge-wrap"></div>
       <div id="detail-name" class="detail-name"></div>
+      <div id="detail-seen-in" class="detail-seen-in"></div>
       <div class="detail-section-label">Observations</div>
       <ul id="detail-observations" class="observations-list"></ul>
       <div class="detail-section-label">Relations</div>
@@ -683,6 +726,7 @@ function buildNodeList() {
   return rawEntities.map(e => {
     const ex = nodes.find(n => n.id === e.name);
     return { id: e.name, entityType: e.entityType, observations: e.observations,
+      seenIn: e.seenIn || [],
       source: e.source, connections: cc[e.name]||0,
       x: ex?.x, y: ex?.y, vx: ex?.vx, vy: ex?.vy, fx: ex?.fx, fy: ex?.fy };
   });
@@ -1021,6 +1065,13 @@ function populateSidebar(d){
       '</div>'+srcBadge;
   }
   document.getElementById('detail-name').textContent=d.name||d.id;
+  // Cross-stack annotation: which Mem0 instances reference this entity.
+  const seenInEl = document.getElementById('detail-seen-in');
+  seenInEl.innerHTML = '';
+  if (Array.isArray(d.seenIn) && d.seenIn.length) {
+    seenInEl.innerHTML = '<span class="seen-label">seen in</span>' +
+      d.seenIn.map(a => '<span class="stack-pill">'+a+'</span>').join('');
+  }
   const obsList=document.getElementById('detail-observations');
   obsList.innerHTML='';
   (d.observations||[]).forEach(obs=>{
@@ -1211,7 +1262,7 @@ const server = http.createServer(async (req, res) => {
       const url = new URL(req.url, "http://localhost");
       const agentId = url.searchParams.get("agent_id") || null;
       const msamResult = await fetchMsamTriples(agentId);
-      const data = buildGraph(msamResult.triples, msamResult.entityTypes ?? new Map());
+      const data = buildGraph(msamResult.triples, msamResult.entityTypes ?? new Map(), msamResult.seenIn ?? new Map());
       res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
       res.end(JSON.stringify(data));
     } catch (e) {

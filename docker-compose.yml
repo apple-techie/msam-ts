@@ -98,12 +98,6 @@ services:
       - ${KG_VIEWER_PATH:-./kg-viewer}:/app:ro
     working_dir: /app
     command: ["node", "server.mjs"]
-    environment:
-      MSAM_URL: http://msam-server:3901
-      MSAM_API_KEY: ${MSAM_API_KEY}
-    depends_on:
-      msam-server:
-        condition: service_healthy
 
   msam-grafana:
     image: grafana/grafana:12.4.1
