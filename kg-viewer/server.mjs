@@ -91,6 +91,8 @@ async function fetchMsamTriples(agentId) {
         subjectType,
         objectType,
         confidence: raw.confidence ?? 1.0,
+        // 'topology' edges come from the infra harvester; 'mem0' from LLM extraction.
+        source: raw.source || "mem0",
       };
       const key = `${t.subject}|${t.predicate}|${t.object}`;
       if (!allTriples.has(key)) allTriples.set(key, t);
@@ -202,7 +204,9 @@ function buildGraph(msamTriples, entityTypesMap, seenInMap) {
         to: t.object,
         relationType: t.predicate.replace(/_/g, " "),
         confidence: t.confidence,
-        source: "mem0",
+        // 'topology' edges (runs_on, member_of, uses, owns from harvester)
+        // get rendered with the orange .link.topology style.
+        source: t.source || "mem0",
       });
     } else {
       const ent = entityMap.get(t.subject);
@@ -379,8 +383,14 @@ const HTML = `<!DOCTYPE html>
   .link { stroke: rgba(34,211,238,0.18); stroke-width: 0.8px; fill: none; transition: stroke 0.2s, stroke-width 0.2s; }
   .link.highlighted { stroke: rgba(255,255,255,0.55); stroke-width: 1.6px; }
   .link.dimmed { stroke: rgba(34,211,238,0.04); }
+  .link.mem0 { stroke: rgba(34,211,238,0.22); }
   .link.msam { stroke: rgba(34,211,238,0.22); }
   .link.goose { stroke: rgba(139,92,246,0.22); }
+  /* Topology edges (runs_on, member_of, uses, owns, located_in from the
+     mem0-topology-harvester) are rendered brighter so the deployment
+     skeleton pops above the LLM-extracted observation noise. */
+  .link.topology { stroke: rgba(245,158,11,0.5); stroke-width: 1.4px; }
+  .link.topology.highlighted { stroke: rgba(252,211,77,0.85); stroke-width: 2px; }
 
   .node-group { cursor: pointer; }
   .node-glow { pointer-events: none; }
@@ -552,7 +562,7 @@ const HTML = `<!DOCTYPE html>
   <div class="logo">\u2B21 KNOWLEDGE GRAPH</div>
   <div id="live-dot" title="Live connection status"></div>
   <div id="stats-pill">\u2014 nodes \u00B7 \u2014 edges</div>
-  <div id="source-pill">MSAM</div>
+  <div id="source-pill">Mem0</div>
   <div id="search-wrap">
     <span id="search-icon">\u2315</span>
     <input id="search" type="text" placeholder="Search nodes\u2026" autocomplete="off" spellcheck="false">
@@ -611,7 +621,7 @@ const HTML = `<!DOCTYPE html>
         <line x1="10" y1="28" x2="30" y2="28" stroke="#64748b" stroke-width="1" stroke-dasharray="2,2"/>
       </svg>
       <p>Click any node to explore its connections and details</p>
-      <span>Double-click to zoom \u00B7 Right-click to unpin \u00B7 Polls MSAM every 30s</span>
+      <span>Double-click to zoom \u00B7 Right-click to unpin \u00B7 Polls Mem0 fleet every 30s</span>
     </div>
     <div id="node-detail">
       <div id="detail-badge-wrap"></div>
@@ -716,8 +726,10 @@ function updateGraph(entities, relations, meta) {
 
 function updateSourcePill() {
   const p = document.getElementById('source-pill');
-  const m = rawMeta.msamTriples || 0;
-  p.textContent = m + ' triples';
+  // mem0Triples is the new field; msamTriples kept as a fallback for cached pages.
+  const m = rawMeta.mem0Triples ?? rawMeta.msamTriples ?? 0;
+  const cs = rawMeta.crossStackEntities;
+  p.textContent = m + ' triples' + (cs ? ' · ' + cs + ' cross-stack' : '');
 }
 
 function buildNodeList() {
@@ -1054,7 +1066,7 @@ function populateSidebar(d){
   document.getElementById('empty-state').style.display='none';
   const detail=document.getElementById('node-detail');
   detail.classList.add('visible');
-  const srcBadge='<span class="source-badge msam">MSAM</span>';
+  const srcBadge='<span class="source-badge msam">Mem0</span>';
   {
     const badgeColor = typeColor(d.entityType);
     const badgeBg = typeBgColor(d.entityType);
