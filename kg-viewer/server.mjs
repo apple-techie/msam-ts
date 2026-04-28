@@ -68,10 +68,26 @@ async function fetchMsamTriples(agentId) {
     return { triples: [], entityTypes, stats: null };
   }
 
-  // Pick which agents to include: a single one or all.
-  const sources = agentId
-    ? (agentData.agent_triples[agentId] ? [[agentId, agentData.agent_triples[agentId]]] : [])
-    : Object.entries(agentData.agent_triples);
+  // Pick which agents to include: a single one (with the hermes topology
+  // overlay always on top), or all of them.
+  // Topology lives only in neo4j-hermes (the harvester writes there) but
+  // describes fleet-wide structure — every per-agent view benefits from
+  // seeing where its gateway runs, what hosts it, etc. So when a specific
+  // agent_id is requested we merge in the topology-sourced rows from hermes
+  // alongside that agent's LLM-extracted memory.
+  let sources;
+  if (agentId) {
+    const own = agentData.agent_triples[agentId] || [];
+    if (agentId === "hermes") {
+      sources = [[agentId, own]];
+    } else {
+      const hermes = agentData.agent_triples["hermes"] || [];
+      const topology = hermes.filter(t => t.source === "topology");
+      sources = [[agentId, own], ["hermes", topology]];
+    }
+  } else {
+    sources = Object.entries(agentData.agent_triples);
+  }
 
   const allTriples = new Map();
   // Track which Mem0 stacks each entity appears in (cross-stack annotation
