@@ -1216,10 +1216,18 @@ async function loadAgents() {
     Object.entries(groups).forEach(([gw, list]) => {
       const grp = document.createElement('optgroup');
       grp.label = gw;
-      list.forEach(a => {
+      // Stack roots first, then sub-agents indented under them so the dropdown
+      // surfaces every distinct agent_id inside a stack (e.g. enduru-botchat,
+      // mv-ops, dexter) — these are real partitions inside the same Mem0 stack.
+      const sorted = [...list].sort((x, y) => {
+        if (!!x.is_stack_root !== !!y.is_stack_root) return x.is_stack_root ? -1 : 1;
+        return x.id.localeCompare(y.id);
+      });
+      sorted.forEach(a => {
         const opt = document.createElement('option');
         opt.value = a.id;
-        opt.textContent = a.id + ' (' + (a.triples || a.atoms) + ' triples)';
+        const prefix = a.is_stack_root ? '' : '  · ';
+        opt.textContent = prefix + a.id + ' (' + (a.triples || a.atoms) + ' triples)';
         grp.appendChild(opt);
       });
       sel.appendChild(grp);
