@@ -1216,18 +1216,14 @@ async function loadAgents() {
     Object.entries(groups).forEach(([gw, list]) => {
       const grp = document.createElement('optgroup');
       grp.label = gw;
-      // Stack roots first, then sub-agents indented under them so the dropdown
-      // surfaces every distinct agent_id inside a stack (e.g. enduru-botchat,
-      // mv-ops, dexter) — these are real partitions inside the same Mem0 stack.
-      const sorted = [...list].sort((x, y) => {
-        if (!!x.is_stack_root !== !!y.is_stack_root) return x.is_stack_root ? -1 : 1;
-        return x.id.localeCompare(y.id);
-      });
-      sorted.forEach(a => {
+      // Each deployment is its own dropdown entry. Label comes from the
+      // resolver's deployment registry (human-readable name), not the slug.
+      list.forEach(a => {
         const opt = document.createElement('option');
         opt.value = a.id;
-        const prefix = a.is_stack_root ? '' : '  · ';
-        opt.textContent = prefix + a.id + ' (' + (a.triples || a.atoms) + ' triples)';
+        const label = a.label || a.id;
+        const host = a.host ? ' · ' + a.host : '';
+        opt.textContent = label + host + ' (' + (a.triples || a.atoms) + ')';
         grp.appendChild(opt);
       });
       sel.appendChild(grp);
