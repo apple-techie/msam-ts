@@ -36,164 +36,98 @@ const clients = new Set();
 
 // ── MSAM Data Fetch ──────────────────────────────────────────────────────────
 
-async function fetchMsamTriples(agentId) {
-  try {
-    const res = await fetch(`${MSAM_URL}/v1/stats`, { headers: MSAM_HEADERS });
-    if (!res.ok) return { triples: [], stats: null };
-    const stats = await res.json();
-
-    // Get all distinct entities from the triples table via a raw SQL approach:
-    // We'll query the top connected entities and their triples.
-    // MSAM's /v1/triples/graph/{entity} returns hops from one entity,
-    // so we need to get ALL triples directly from the DB.
-    // Use a bulk query approach: fetch top entities and their neighborhoods.
-    
-    // Strategy: query triples for the top 50 entities by connection count
-    const topRes = await fetch(`${MSAM_URL}/v1/query`, {
-      method: "POST",
-      headers: MSAM_HEADERS,
-      body: JSON.stringify({
-        query: "all entities people projects organizations",
-        top_k: 1, // we just need to trigger the API, we'll use triples directly
-      }),
-    });
-
-    // When a specific agent is selected, return only that agent's triples
-    // from the per-agent export (served from /data/agent-triples.json).
-    // NOTE: this path bypasses MSAM's entity_types map, so types fall back
-    // to whatever the export file carries. Safe for filtering but loses
-    // the canonical type view until we plumb types into the export.
-    const agentData = loadAgentData();
-    if (agentId) {
-      if (agentData && agentData.agent_triples && agentData.agent_triples[agentId]) {
-        return { triples: agentData.agent_triples[agentId], entityTypes: new Map(), stats };
-      }
-      return { triples: [], entityTypes: new Map(), stats };
-    }
-
-    // "All Agents" view: ALWAYS pull from MSAM's graph endpoint so we get the
-    // canonical, up-to-date entity_types. The agent-triples.json export is a
-    // static snapshot and lags behind the LLM reclassification pipeline.
-
-    const FALLBACK_SEEDS = [
-      "Drew", "Kainotomic", "Enduru AI", "Ryan", "User",
-      "LetsDisagree", "Vercel", "Stripe", "HubSpot", "Aurora",
-      "Mark Fulton", "Justin Walker", "Sannidhya Sah",
-    ];
-
-    let seeds = FALLBACK_SEEDS;
-    try {
-      const accelRes = await fetch(`${GRAPH_ACCEL_URL}/query`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          cypher: "MATCH (n:Entity) WITH n, size([(n)-[]-() | 1]) AS degree RETURN n.name AS name ORDER BY degree DESC LIMIT 30",
-        }),
-      });
-      if (accelRes.ok) {
-        const accelData = await accelRes.json();
-        const dynamicSeeds = (accelData.results || [])
-          .map((r) => r.name)
-          .filter((n) => n && n.length > 1);
-        if (dynamicSeeds.length >= 5) {
-          seeds = dynamicSeeds;
-          log(`Using ${seeds.length} dynamic seeds from graph accelerator`);
-        }
-      }
-    } catch (e) {
-      log("Graph accelerator unreachable, using fallback seeds:", e.message);
-    }
-
-    const allTriples = new Map();
-    const entityTypes = new Map(); // name -> { type: string, votes: number }
-
-    await Promise.all(
-      seeds.map(async (entity) => {
-        try {
-          const r = await fetch(
-            `${MSAM_URL}/v1/triples/graph/${encodeURIComponent(entity)}`,
-            { headers: MSAM_HEADERS }
-          );
-          if (!r.ok) return;
-          const data = await r.json();
-          // Handle both legacy {hops: {0: [...], 1: [...]}} and current {relations: [...]} shapes
-          const triples = [
-            ...(data.relations || []),
-            ...Object.values(data.hops || {}).flat(),
-          ];
-          for (const t of triples) {
-            if (!t || !t.subject || !t.predicate || !t.object) continue;
-            const key = `${t.subject}|${t.predicate}|${t.object}`;
-            if (!allTriples.has(key)) {
-              allTriples.set(key, t);
-            }
-          }
-          // Capture per-entity types from MSAM's graphTraverse response
-          if (data.entity_types && typeof data.entity_types === "object") {
-            for (const [name, type] of Object.entries(data.entity_types)) {
-              if (!type) continue;
-              const existing = entityTypes.get(name);
-              if (!existing || existing.type === type) {
-                entityTypes.set(name, { type, votes: (existing?.votes ?? 0) + 1 });
-              }
-            }
-          }
-        } catch {}
-      })
-    );
-
-    return {
-      triples: [...allTriples.values()],
-      entityTypes,
-      stats,
-    };
-  } catch (e) {
-    log("MSAM fetch failed:", e.message);
-    return { triples: [], entityTypes: new Map(), stats: null };
-  }
+// Title-case a label for display, e.g. "concept" -> "Concept".
+// Mem0's bounded export emits lowercase ("person", "concept", ...); MSAM legacy
+// emits TitleCase. We normalize to TitleCase for consistent UI buckets.
+function titleCase(s) {
+  if (!s) return s;
+  if (s === "__User__") return "User";
+  return s.charAt(0).toUpperCase() + s.slice(1);
 }
 
-// ── Build graph from MSAM triples ────────────────────────────────────────────
+async function fetchMsamTriples(agentId) {
+  // Single source of truth: agent-triples.json (Mem0-sourced, refreshed by the
+  // /opt/msam-data/agent-graph-export-mem0.py cron every 15min). We no longer
+  // hit MSAM at all — both the per-agent and aggregate views read from the
+  // same exported snapshot, so type and predicate vocabularies are consistent.
+  const agentData = loadAgentData();
+  const entityTypes = new Map();
 
-// Predicates that are noisy/low-value for visualization
-const SKIP_PREDICATES = new Set([
-  "has", "is", "status", "includes", "include", "has_status",
-  "has_env_var", "has_column", "model", "available_models",
-  "checks", "remaining_targets", "shows", "schedule",
-  "added", "updated", "created", "fixed",
-]);
+  if (!agentData || !agentData.agent_triples) {
+    return { triples: [], entityTypes, stats: null };
+  }
 
-// Entities that are too generic to visualize
+  // Pick which agents to include: a single one or all.
+  const sources = agentId
+    ? (agentData.agent_triples[agentId] ? [[agentId, agentData.agent_triples[agentId]]] : [])
+    : Object.entries(agentData.agent_triples);
+
+  const allTriples = new Map();
+  for (const [, agentTriples] of sources) {
+    for (const raw of agentTriples) {
+      if (!raw || !raw.subject || !raw.predicate || !raw.object) continue;
+      // Normalize snake_case (Mem0 export) and camelCase (legacy) into one shape.
+      const subjectType = titleCase(raw.subject_type || raw.subjectType);
+      const objectType = titleCase(raw.object_type || raw.objectType);
+      const t = {
+        subject: raw.subject,
+        predicate: raw.predicate,
+        object: raw.object,
+        subjectType,
+        objectType,
+        confidence: raw.confidence ?? 1.0,
+      };
+      const key = `${t.subject}|${t.predicate}|${t.object}`;
+      if (!allTriples.has(key)) allTriples.set(key, t);
+
+      // Vote-merge entity types so the same name with different types (e.g. cross-agent)
+      // tallies correctly.
+      const tally = (name, type) => {
+        if (!name || !type) return;
+        const existing = entityTypes.get(name);
+        if (!existing) entityTypes.set(name, { type, votes: 1 });
+        else if (existing.type === type) existing.votes += 1;
+        else if (existing.votes < 1) entityTypes.set(name, { type, votes: 1 });
+      };
+      tally(t.subject, subjectType);
+      tally(t.object, objectType);
+    }
+  }
+
+  return {
+    triples: [...allTriples.values()],
+    entityTypes,
+    stats: { agents: agentData.agents || [] },
+  };
+}
+
+// ── Build graph from Mem0 triples ────────────────────────────────────────────
+
+// Predicates we deliberately keep — these come from the bounded Mem0 vocab
+// (15 relation types) and every one is meaningful as an edge. The previous
+// MSAM-era SKIP set incorrectly suppressed `created`, `has_status`, etc.
+// because MSAM's free-form predicates dwarfed the signal there.
+// Empty SKIP set lets all bounded relations through.
+const SKIP_PREDICATES = new Set([]);
+
+// Entities that are too generic to visualize as nodes.
 const SKIP_ENTITIES = new Set([
-  "User", "true", "false", "True", "False", "None", "null",
+  "true", "false", "True", "False", "None", "null",
   "unknown", "N/A", "n/a", "",
 ]);
 
 /**
- * Per-triple entity type resolver.
- *
- * Priority:
- *   1. Type from MSAM `entity_types` map (populated from triples.subject_type /
- *      object_type columns, which are LLM-assigned at extraction time).
- *   2. Per-triple type carried on the relation itself (`subjectType`/`objectType`
- *      fields from MSAM's /v1/triples/graph response).
- *   3. Fallback "Entity" for triples whose entities haven't been typed yet
- *      (pre-Plan-B data that the backfill missed).
- *
- * There is no pattern matching here. Types are source-of-truth from MSAM.
+ * Per-triple entity type resolver — uses the export's own subject/object types
+ * (already normalized to TitleCase). Falls back to Entity for the rare untyped
+ * case (e.g. a name that appears in MSAM-legacy triples without typing).
  */
 function resolveEntityType(name, triples, entityTypesMap) {
-  // 1. MSAM's graphTraverse-resolved map (majority vote across all known triples)
   const fromMap = entityTypesMap.get(name);
   if (fromMap?.type) return fromMap.type;
-
-  // 2. Per-triple annotation (first seen wins since the map above already votes)
   for (const t of triples) {
     if (t.subject === name && t.subjectType) return t.subjectType;
     if (t.object === name && t.objectType) return t.objectType;
   }
-
-  // 3. Untyped — schedule for backfill or next LLM re-extraction
   return "Entity";
 }
 
