@@ -1,0 +1,10 @@
+{
+  "name": "kg-viewer",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Live knowledge graph visualizer for goose MCP memory",
+  "scripts": {
+    "start": "node server.mjs",
+    "dev": "node server.mjs"
+  }
+}

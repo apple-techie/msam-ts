@@ -1,0 +1,53 @@
+{
+  "name": "msam",
+  "version": "2026.4.3",
+  "description": "Multi-Stream Adaptive Memory — cognitive memory architecture for AI agents",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "msam": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx src/index.ts",
+    "start": "node dist/index.js",
+    "serve": "node dist/index.js serve",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
+    "lint": "tsc --noEmit",
+    "db:generate": "drizzle-kit generate",
+    "db:migrate": "drizzle-kit migrate",
+    "db:studio": "drizzle-kit studio",
+    "migrate:sqlite": "tsx scripts/migrate-from-sqlite.ts"
+  },
+  "dependencies": {
+    "@fastify/cors": "^11.0.0",
+    "@fastify/rate-limit": "^10.3.0",
+    "@fastify/swagger": "^9.0.0",
+    "@toml-tools/parser": "^1.0.0",
+    "commander": "^13.0.0",
+    "drizzle-orm": "^0.38.0",
+    "fastify": "^5.2.0",
+    "pg": "^8.13.0",
+    "pgvector": "^0.2.0",
+    "pino": "^9.0.0",
+    "prom-client": "^15.1.0",
+    "smol-toml": "^1.6.1",
+    "undici": "^7.0.0",
+    "zod": "^3.24.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^22.0.0",
+    "@types/pg": "^8.11.0",
+    "better-sqlite3": "^12.8.0",
+    "drizzle-kit": "^0.30.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0",
+    "vitest": "^3.0.0"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  }
+}

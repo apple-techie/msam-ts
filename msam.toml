@@ -1,0 +1,83 @@
+# MSAM Configuration for Remote Deployment (host-a)
+# Adapted from Mac Studio config for Docker container
+
+[embedding]
+provider = "openai"
+url = "https://api.openai.com/v1/embeddings"
+model = "text-embedding-3-small"
+dimensions = 1536
+api_key_env = "OPENAI_API_KEY"
+max_input_chars = 2000
+timeout_seconds = 10
+batch_size = 50
+
+[storage]
+db_path = "msam.db"
+metrics_db_path = "msam_metrics.db"
+token_budget_ceiling = 500000
+auto_compact_threshold_pct = 90
+refuse_threshold_pct = 99
+db_busy_timeout_ms = 5000
+
+[retrieval]
+default_top_k = 12
+semantic_weight = 0.7
+confidence_sim_high = 0.45
+confidence_sim_medium = 0.30
+confidence_sim_low = 0.15
+spreading_activation_enabled = true
+max_spread_hops = 4
+spread_decay_factor = 0.3
+
+[decay]
+protection_days = 7
+reactivation_threshold = 0.5
+reactivation_min_access = 2
+auto_enabled = true
+schedule_hours = 24
+trigger_threshold_pct = 85
+
+[working_memory]
+default_ttl_minutes = 240
+promotion_threshold = 2
+default_profile = "lightweight"
+
+[atoms]
+default_profile = "standard"
+default_encoding_confidence = 0.7
+default_arousal = 0.5
+default_valence = 0.0
+
+[agents]
+default_agent_id = "gateway-one"
+enable_sharing = true
+
+[api]
+port = 3901
+host = "0.0.0.0"
+
+[metrics]
+enabled = true
+log_access_events = true
+
+[context]
+default_token_budget = 500
+default_top_k = 10
+probe_token_budget = 200
+probe_top_k = 5
+startup_identity_query = "agent identity core traits personality"
+startup_user_query = "user preferences relationship current situation"
+startup_recent_query = "what happened today recent activity"
+startup_emotional_query = "emotional state mood current feeling"
+metrics_port = 3001
+
+[triples]
+llm_url = "https://integrate.api.nvidia.com/v1/chat/completions"
+llm_model = "mistralai/mistral-large-3-675b-instruct-2512"
+api_key_env = "NVIDIA_NIM_API_KEY"
+
+[annotation]
+llm_url = "https://api.project_one.com/v1/chat/completions"
+llm_model = "gh/claude-haiku-4.5"
+timeout_seconds = 15
+api_key_env = "KAINOTOMIC_API_KEY"

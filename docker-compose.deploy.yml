@@ -1,0 +1,179 @@
+services:
+  msam-db:
+    image: pgvector/pgvector:pg16
+    container_name: msam-db
+    restart: unless-stopped
+    volumes:
+      - msam-pgdata:/var/lib/postgresql/data
+    environment:
+      POSTGRES_DB: msam
+      POSTGRES_USER: msam
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-msam}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U msam -d msam"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  msam:
+    image: msam-ts:latest
+    #build:
+      #context: .
+      #dockerfile: Dockerfile
+    container_name: msam-ts-server
+    restart: unless-stopped
+    volumes:
+      - /opt/msam-data/msam.toml:/app/msam.toml:ro
+    environment:
+      - DATABASE_URL=postgresql://msam:${POSTGRES_PASSWORD:-msam}@msam-db:5432/msam
+      - MSAM_CONFIG=/app/msam.toml
+      - MSAM_API_KEY=${MSAM_API_KEY}
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - KAINOTOMIC_API_KEY=${KAINOTOMIC_API_KEY}
+      - NVIDIA_NIM_API_KEY=${NVIDIA_NIM_API_KEY}
+      - GRAPH_ACCEL_URL=http://graph-accelerator:3902
+      - GRAPH_SYNC_DEBOUNCE_SECONDS=300
+    depends_on:
+      msam-db:
+        condition: service_healthy
+    networks:
+      default:
+        aliases:
+          - msam
+      msam-deploy:
+        aliases:
+          - msam
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"fetch('http://localhost:3901/v1/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))\""]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  neo4j:
+    image: neo4j:5-community
+    container_name: msam-neo4j-central
+    restart: unless-stopped
+    volumes:
+      - neo4j-data:/data
+    environment:
+      NEO4J_AUTH: none
+      NEO4J_server_memory_heap_max__size: 512m
+      NEO4J_server_memory_heap_initial__size: 256m
+    healthcheck:
+      test: wget -q --spider http://localhost:7474 || exit 1
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  graph-accelerator:
+    image: msam-deploy-graph-accelerator
+    container_name: msam-graph-accelerator
+    restart: unless-stopped
+    volumes:
+      - /opt/msam-data:/data/msam:ro
+      - /opt/msam-data/triples_patched.py:/app/msam/triples.py
+      - /opt/msam-data/server_patched.py:/usr/local/lib/python3.12/site-packages/msam/server.py
+      - /opt/msam-data/config_patched.py:/app/app/config.py
+      - /opt/msam-data/neo4j_loader_patched.py:/app/etl/neo4j_loader.py
+      - /opt/msam-data/entity_resolver_patched.py:/app/etl/entity_resolver.py
+      - /opt/msam-data/pipeline_patched.py:/app/etl/pipeline.py
+      - /opt/msam-data/msam_reader_patched.py:/app/etl/msam_reader.py
+    environment:
+      - NEO4J_URI=bolt://neo4j:7687
+      - NEO4J_USER=
+      - NEO4J_PASSWORD=
+      - MSAM_DB_PATH=/data/msam/msam.db
+      - MSAM_PG_URL=postgresql://msam:${POSTGRES_PASSWORD:-msam}@msam-db:5432/msam
+      - API_PORT=3902
+      - ENABLE_Project_Two=false
+      - ENABLE_GIT=false
+    depends_on:
+      neo4j:
+        condition: service_healthy
+      msam:
+        condition: service_healthy
+    healthcheck:
+      test: python -c "import urllib.request; urllib.request.urlopen('http://localhost:3902/health')"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  kg-viewer:
+    image: node:22-slim
+    container_name: msam-kg-viewer
+    restart: unless-stopped
+    volumes:
+      - ./kg-viewer:/app:ro
+      # Externally-synced per-agent triple export (not tracked in git since it's generated data).
+      # Mounted outside /app because /app is read-only and nested bind-mounts can't create mountpoints.
+      - /opt/msam-data/kg-viewer/agent-triples.json:/data/agent-triples.json:ro
+    working_dir: /app
+    command:
+      - node
+      - server.mjs
+    environment:
+      - MSAM_URL=http://msam:3901
+      - MSAM_API_KEY=${MSAM_API_KEY}
+    depends_on:
+      msam:
+        condition: service_healthy
+
+  grafana:
+    image: grafana/grafana:12.4.1
+    container_name: msam-grafana
+    restart: unless-stopped
+    volumes:
+      - /opt/msam-data/grafana:/var/lib/grafana
+    environment:
+      - GF_INSTALL_PLUGINS=simpod-json-datasource
+      - GF_SERVER_ROOT_URL=https://openclaw-msam-1.your-tailnet.ts.net/
+      - GF_SERVER_DOMAIN=openclaw-msam-1.your-tailnet.ts.net
+      - GF_SECURITY_ALLOW_EMBEDDING=true
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Viewer
+    networks:
+      - default
+      - otel-net
+
+  tailscale:
+    image: tailscale/tailscale:latest
+    container_name: msam-tailscale
+    restart: unless-stopped
+    hostname: openclaw-msam
+    environment:
+      - TS_AUTHKEY=${TAILSCALE_AUTHKEY}
+      - TS_HOSTNAME=openclaw-msam
+      - TS_STATE_DIR=/var/lib/tailscale
+      - TS_EXTRA_ARGS=--accept-dns=false
+      - TS_SERVE_CONFIG=/config/serve.json
+    volumes:
+      - msam-tailscale-state:/var/lib/tailscale
+      - /opt/msam-data/tailscale-serve.json:/config/serve.json:ro
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    depends_on:
+      grafana:
+        condition: service_started
+      kg-viewer:
+        condition: service_started
+
+volumes:
+  neo4j-data:
+    name: compose-hack-1080p-monitor-1utdpf_neo4j-data
+  msam-tailscale-state:
+    name: compose-hack-1080p-monitor-1utdpf_msam-tailscale-state
+  msam-pgdata:
+    name: msam-ts_msam-pgdata
+    external: true
+
+networks:
+  otel-net:
+    external: true
+  dokploy-network:
+    external: true
+  msam-deploy:
+    name: msam-deploy_default
+    external: true

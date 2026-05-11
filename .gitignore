@@ -1,0 +1,15 @@
+node_modules/
+dist/
+*.js
+*.d.ts
+*.js.map
+*.d.ts.map
+!vitest.config.ts
+!drizzle.config.ts
+!tsconfig.json
+.env
+*.env
+.env.*
+!.env.example
+msam.toml
+coverage/
